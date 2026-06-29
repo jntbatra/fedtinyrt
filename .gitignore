@@ -1,0 +1,10 @@
+Debug/
+.settings/
+.launches/
+*.d
+*.o
+*.elf
+*.srec
+*.hex
+*.map
+JLinkLog.log
