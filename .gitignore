@@ -8,3 +8,8 @@ Debug/
 *.hex
 *.map
 JLinkLog.log
+ml/data/
+ml/artifacts/*.npz
+ml/artifacts/*.tflite
+ml/artifacts/saved_model/
+__pycache__/
