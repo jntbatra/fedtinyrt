@@ -98,6 +98,45 @@ Ship the A-pretrained model to machine B, fine-tune on a slice of B's **own** da
 | `artifacts/model_data.c/.h` | model as C array + feature mean/std for firmware |
 | `artifacts/golden_vectors.json` | input→output oracle for on-device validation |
 
+---
+
+## Federation (Layer 3) — results
+
+Federation needs many clients sharing the same label space. IMS (few imbalanced
+run-to-failures) is a poor fit, so federation is demonstrated on **CWRU** with
+4 clients = 4 motor loads (0/1/2/3 HP), each holding ALL fault classes
+(normal / inner / outer / ball). Only head weights are FedAvg'd; raw vibration
+never leaves a node. Algorithm: standard FedAvg (equal weight, 5 local epochs,
+25 rounds) + optional local personalization.
+
+**Scenario 1 — data-rich clients** (federation should not hurt):
+
+| client (load) | local-only | federated | fed+personalized |
+|---|---|---|---|
+| 1730/1750/1772/1797 RPM | 0.997–1.000 | **1.000** | 1.000 |
+
+One shared, privacy-preserving model reaches 100% on every load.
+
+**Scenario 2 — data-scarce clients** (32 training windows each — federation should add value):
+
+| client | local-only | federated | fed+personalized |
+|---|---|---|---|
+| 1730 | 0.768 | **0.958** | 0.955 |
+| 1750 | 0.881 | **0.958** | 0.958 |
+| 1772 | 0.736 | **0.956** | 0.959 |
+| 1797 | 0.717 | **0.923** | 0.944 |
+
+Starved clients jump from ~0.72–0.88 (alone) to **0.92–0.96** by pooling knowledge
+via FedAvg — all >90%, no raw data shared. This is the federation value proposition.
+
+### Honest notes
+- CWRU fault-type classification is *easy* (distinct fault frequencies) — 100% is
+  normal for it. The demonstration is the **federation mechanism**, not task difficulty.
+- On IMS, federation across two full machine-nodes also works (>96% balanced, no hurt);
+  but a node missing an entire class (artificial) is not recoverable by plain FedAvg —
+  a real non-IID limitation that motivates personalization.
+- Files: `federate.py` (IMS 2-node + scenarios), `federate_cwru.py` (CWRU 4-client).
+
 ## Numbers to quote (honest)
 
 - **Same-machine:** ~97% balanced
