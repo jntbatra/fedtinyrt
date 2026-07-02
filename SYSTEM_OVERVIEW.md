@@ -76,9 +76,17 @@ model → personalize → repeat. Raw signal never leaves the board; only ~KB of
   **inference** far faster/cheaper than the CPU. **It cannot train** (inference only).
 - **Memory tiers:** TCM 256 KB (M85) / 128 KB (M33) · 2 MB SRAM (activations) · 1.6 MB ECC SRAM ·
   **1 MB MRAM** (non-volatile: code + model) · board adds 64 MB flash + 64 MB SDRAM.
-- **Ethernet (gigabit-capable)** — carries weights only, and only during sync windows.
+- **Ethernet (gigabit-capable, with TSN)** — carries weights only, and only during sync windows.
+  **No onboard BLE/WiFi** — the RA8P1 has no radio; Ethernet is the only link.
 - **TrustZone**, 22 nm ultra-low-leakage process (low power).
-- **No onboard accelerometer** — one is added over I2C (Grove/Qwiic).
+- **No onboard accelerometer** — one is added over I2C (Grove/Qwiic) for the bench/liveness demo.
+
+**Physical form — the board is NOT worn.** It is a **desk/cart clinic base station** (big, has a
+display, mains-powered — a fall hazard on a patient). The patient wears only a **small sensor node**:
+`[Decision #24]` an **ESP32-C3/S3 + accelerometer** clipped to the waist that streams readings over the
+**hospital WiFi/LAN to the base station's Ethernet** (no radio added to the RA8P1). Long wires to a
+walking, fall-prone patient are rejected (unreliable + trip hazard). *The wearable is a documented
+extension; the contest demo uses dataset replay + a hand-waved accel as a liveness prop.*
 
 **Why two cores matter:** inference (M85) and training (M33) run on **physically separate cores at the
 same time**, so learning can never delay the real-time screening. That is the core RTOS thesis.
@@ -155,6 +163,7 @@ These are the things we take as true; if one breaks, results may change.
 | A8 | Network is intermittent; the device works offline and syncs weights when connected. | `[Design decision]` — offline-first. |
 | A9 | Federation is *trusted* (hospitals are honest) in v1. | `[Assumption]` — malicious-node robustness is a future extension. |
 | A10 | Clinical labels come from clinicians in production; dataset labels stand in for the demo. | `[Design decision]`. |
+| A11 | The board is a desk base station; the patient wears only a small wireless accel node (ESP32→LAN). | `[Decision #24]` — no radio on RA8P1; wearable is a documented extension, not needed for the demo. |
 
 ---
 

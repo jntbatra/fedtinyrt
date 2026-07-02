@@ -28,7 +28,7 @@ Parkinson's Freezing-of-Gait, learning on-device, federating **weights only** ac
 ### Data states (name the state; raw never leaves the board)
 | State | Definition |
 |-------|------------|
-| `Raw_Window` | 2 s of triaxial accel @100 Hz = 200×3 samples in the DMA ring buffer. Board-local only. |
+| `Raw_Window` | 2 s of triaxial accel @100 Hz = 200×3 samples in the DMA ring buffer. Ingested via **I2C DMA** (demo) or **LAN packets from the ESP32 wearable** (production, decision #24). Node-local only. |
 | `Feature_Vector` | Derived from `Raw_Window`: FI-MLP path = Freeze-Index + band-power + stats; CNN path = normalized `Raw_Window` tensor. Board-local only. |
 | `Label` | Ground truth for a window. Demo = dataset annotation (StartHesitation/Turn/Walking→collapsed per Q12b). Production = clinician diagnosis. Board-local only. |
 | `Aggregation_Payload` | The ONLY state that crosses the network: full dense **FP32** weights of the shared layers (see §2). |
@@ -81,6 +81,18 @@ weights/activations from SRAM via DMA; M85 blocks-or-works until the NPU raises 
 - `[Decision]` Measure: avg power idle-vs-active; NPU-vs-CPU energy per inference; Ethernet PHY off except sync.
 - **Thermal envelope: `[Unresolved]`** — not characterized; M85 @1 GHz + NPU sustained load thermal behavior unknown. No throttling policy defined.
 
+### 1.6 Connectivity & physical form `[Verified — Renesas]`
+- **No onboard BLE / WiFi / Bluetooth.** RA8P1 has no radio (Renesas wireless = RA6W1/W2, RA4W1 lines).
+  Only wired **Gigabit Ethernet (RGMII) with TSN**.
+- **Physical form (decision #24):** the board is a **desk/cart clinic BASE STATION**, never worn — it is
+  large, has a display, needs mains power, and would be a fall hazard on a patient.
+- **Body-worn sensor front-end (Option A, extension):** a small **ESP32-C3/S3 wearable** (accel + WiFi)
+  clips to the patient's waist, timestamps samples @100 Hz, and streams accel packets over the
+  **hospital LAN** to the base station's **Ethernet IP**. **No radio is added to the RA8P1.**
+- **`Sensor_Ingest` has two modes:** (1) **direct I2C** accel wired to M85 (demo liveness prop / bench);
+  (2) **LAN packet ingest** from the ESP32 wearable (production). Both yield `Raw_Window` on the base
+  station. Long I2C cables to a walking patient are rejected (unreliable + trip hazard).
+
 ---
 
 ## 2. Bounded Context: Federated Learning
@@ -99,7 +111,14 @@ weights/activations from SRAM via DMA; M85 blocks-or-works until the NPU raises 
 - `[Unresolved / future]` alternatives: **delta** (`Global_Model[r] − Global_Model[r-1]`) to enable compression + DP; **LoRA adapters** (low-rank) to shrink payload; **sparse/top-k**. None in v1.
 
 ### 2.3 Privacy / security constraints
-- **Hard invariant:** only `Aggregation_Payload` crosses the network. `Raw_Window`/`Feature_Vector`/`Label` **never** leave the board. Enforced by the **M33 egress gate**. `[Decision]`
+- **Hard invariant (refined for the wearable):** a **Node = wearable sensor + base station** (one
+  hospital). Only `Aggregation_Payload` crosses the **federation network** (base-station ↔ base-station,
+  between hospitals). `Raw_Window`/`Feature_Vector`/`Label` **never leave the Node**. Enforced by the
+  **M33 egress gate**. `[Decision]`
+- **Two distinct networks — do not confuse:** (1) **wearable → base station** over the *hospital LAN*
+  (BLE/WiFi/Ethernet, *intra*-Node): raw accel travels here — allowed, local, should be encrypted.
+  (2) **base station ↔ base station** over Ethernet (*inter*-Node): **weights only**. The privacy
+  guarantee is about network (2), not (1).
 - **Threat model:** `[Decision]` the network + other hospitals. On-board M85↔M33 is trusted (so M33 is a *network* gate, not a raw-data enclave — ADR-002).
 - **Differential Privacy:** `[Unresolved / future]` — no DP noise on payloads in v1. If added, switch to delta payloads and calibrate a noise multiplier (ε,δ **undefined**).
 - **Secure Aggregation:** `[Unresolved / future]` — not implemented. v1 trusts the aggregator to see plaintext FP32 payloads.
@@ -224,6 +243,7 @@ TCM 256 KB/128 KB, 2 MB SRAM, 1 MB MRAM, INT8/INT16 NPU, TrustZone, 22ULL).
 | 21 | Clinic device (mains); measure sleep + NPU-vs-CPU energy + PHY-off; no unmeasured battery claim. |
 | 22 | Cold-start = pretrained seed (Daphnet), disjoint from eval. |
 | 23 | Dataset v1 = Kaggle-only (tdcsfog hospitals + defog unseen) + Daphnet seed; FoG-STAR = extension. |
+| 24 | **Physical form = desk/cart base station (not worn).** Body-worn sensor = **ESP32-C3/S3 wearable → WiFi → hospital LAN → base-station Ethernet** (Option A; no radio added to RA8P1). Node = wearable + base station. Two networks: intra-Node LAN (raw ok) vs inter-Node federation (weights only). Wearable = documented **extension**; demo uses dataset replay + I2C liveness prop. Long I2C cables rejected (unsafe for fall-prone patients). RA8P1 has NO onboard BLE/WiFi. |
 
 ## Appendix B — ADRs
 - **ADR-001** — Pivot industrial → cross-silo hospital FoG federation (privacy essential; differentiates from LGX-Shield; keeps ~75% of submitted proposal).

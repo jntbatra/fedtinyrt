@@ -93,6 +93,8 @@ then real sensor/data/model (S4–S6), then concurrency/failure/power/science (S
 - **Proves:** §4.2 (0 missed 100 Hz deadlines), DMA path, F6 (sensor liveness), "board does prediction".
 - **Resolves:** confirms §1.2 latency under real sampling.
 - **Depends on:** S1. Needs the external accel chip (pending part name for I2C driver).
+- **Ingest mode:** demo = **direct I2C→DMA** (this slice). Production = **LAN packets from the ESP32
+  wearable** (see S11); the `AccelSampler` task then becomes a `SensorIngest` task. Same `Raw_Window`.
 - **HIL:** GIVEN live accel motion WHEN sampled 60 s THEN 0 missed sampling deadlines AND a live
   prediction updates each 1 s AND unplugging the sensor raises `liveness=false` (no false negative).
 
@@ -145,6 +147,19 @@ then real sensor/data/model (S4–S6), then concurrency/failure/power/science (S
 - **Proves:** the scientific claim (context.md Appendix C), §2.1 `T_auprc`.
 - **Depends on:** S5, S6.
 - **HIL/analysis:** report local vs federated vs personalized, LOHO, and lab→home AUPRC.
+
+### S11 — Wearable sensor node (EXTENSION, do only if v1 done)
+- **Slice:** **ESP32-C3/S3 + accel** clipped to the body → sample @100 Hz, timestamp → stream over
+  **WiFi/LAN** → base-station **Ethernet** `SensorIngest` → same `Raw_Window` → live prediction.
+- **Vertical path:** ESP32(accel+WiFi) → hospital LAN → RA8P1 Ethernet → M85 → NPU → display.
+- **Proves:** decision #24 (base-station + wireless wearable), RFC-001 F8 (wearable link drop),
+  two-networks privacy split (intra-Node LAN vs inter-Node federation).
+- **Depends on:** S4 (ingest path), S1.
+- **HIL:** GIVEN a body-worn ESP32 WHEN a patient walks THEN base station reconstructs clean 100 Hz
+  windows AND predicts live AND a dropped link → `liveness=false` (no false negative) AND raw accel
+  never crosses the inter-Node federation link.
+- **Note:** NOT needed for the contest demo (dataset replay + I2C liveness prop suffice). Build only
+  if S0–S10 are Done.
 
 ---
 

@@ -110,6 +110,7 @@
 | F5 | **Network partition / dropped payload** | Missed ACK within `T_round` | Store-and-forward: retransmit on next link-up; round proceeds on quorum (§2.2). | none (offline-first) |
 | F6 | **Sensor drift / disconnect (I2C accel)** | I2C NAK / out-of-range / flat signal | Flag `liveness=false`; suppress prediction (no false `no-freeze`); require re-calibration. | screening paused, safe |
 | F7 | **Inter-core desync (stale shared SRAM)** | sequence/version tag on mailbox message | Per `context.md`: M85 **cache-clean before handoff**, M33 **invalidate before read**; mismatched version → re-request. | none |
+| F8 | **Wearable link drop (ESP32 → LAN → base station)** | missed/late accel packets vs expected 100 Hz | Base station flags `liveness=false`, suppresses prediction (no false `no-freeze`); wearable buffers + retransmits; resume on reconnect. Soft deadline tolerates buffered catch-up. `[context.md #24]` | screening paused, safe |
 
 `[Invariant — safety]` On any inference-path fault, the system **withholds a prediction** rather than
 emit a possibly-wrong `no-freeze` (a missed-freeze is the costly error). Fail safe, not silent.
@@ -117,8 +118,11 @@ emit a possibly-wrong `no-freeze` (a missed-freeze is the costly error). Fail sa
 ---
 
 ## 4. Global Invariants (never violated)
-1. **Data locality:** only `Aggregation_Payload` (FP32 shared weights) crosses the network. `Raw_Window`,
-   `Feature_Vector`, `Label` never leave the board. Enforced by the M33 egress gate.
+1. **Data locality:** a **Node = wearable sensor + base station** (one hospital). Only
+   `Aggregation_Payload` (FP32 shared weights) crosses the **inter-Node federation network**.
+   `Raw_Window`, `Feature_Vector`, `Label` never leave the **Node**. The intra-Node link
+   (wearable → base station over the hospital LAN) may carry raw accel — local, encrypted, allowed.
+   Enforced by the M33 egress gate. `[context.md #24]`
 2. **Real-time primacy:** the P1 `AccelSampler` (100 Hz) preempts everything; **0 missed sampling
    deadlines**, including during F1/F2 faults and on-device training.
 3. **No in-place model mutation:** models update via A/B slot swap only.
