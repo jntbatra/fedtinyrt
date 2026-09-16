@@ -19,7 +19,7 @@ import numpy as np
 from feature_extract import extract, windows_from_signal
 
 HERE = os.path.dirname(__file__)
-DATA = os.path.join(HERE, "data", "data" if False else "extracted")
+DATA = os.path.join(HERE, "..", "data", "extracted")
 ART = os.path.join(HERE, "artifacts")
 
 BASELINE_FRAC = 0.20   # first 20% of life = healthy reference

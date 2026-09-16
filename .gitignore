@@ -13,3 +13,12 @@ ml/artifacts/*.npz
 ml/artifacts/*.tflite
 ml/artifacts/saved_model/
 __pycache__/
+.venv/
+.cache/
+.pytest_cache/
+tests/host/build/
+ml/legacy_bearing/artifacts/*.npz
+ml/legacy_bearing/artifacts/*.tflite
+ml/legacy_bearing/artifacts/saved_model/
+ml/sleep/data/
+ml/sleep/artifacts/

@@ -1,163 +1,95 @@
-# FedTinyRT
+# FedTinyRT Sleep
 
-Federated on-device learning system running on Renesas EK-RA8P1 using μT-Kernel 3.0.
+FedTinyRT is being adapted in place from the bearing/FoG proof of concept to
+adaptive, personalized sleep-event screening on EK-RA8P1 with µT-Kernel 3.0.
+The existing FSP boot, small-network training, INT8 export, golden vectors and
+PC federation workflow remain the foundation.
 
-TRON Programming Contest 2026 submission.
+**Current validation uses synthetic fixtures. No real sleep performance or
+hardware completion is claimed.** The supplied [development brief](context.md)
+defines the target; this README describes current implementation status.
 
-## Hardware
+## What changed
 
-| Component | Details |
-|-----------|---------|
-| Board | Renesas EK-RA8P1 |
-| MCU | RA8P1 (R7KA8P1KFLCAC) |
-| CPU | Arm Cortex-M85 @ 1GHz |
-| Flash | 1MB MRAM |
-| RAM | 2MB SRAM |
-| External | 64MB Octo-SPI Flash, 64MB SDRAM |
+| Area | Current state |
+| --- | --- |
+| Bearing experiments | Preserved in `ml/legacy_bearing/`, including original artifacts and results |
+| Existing README edits | Exact pre-migration copy in `docs/legacy/README.pre-sleep.md` |
+| Firmware boot | Generated startup and `hal_entry.cpp` retained |
+| µT-Kernel application | Separate acquisition and processing tasks with static stacks |
+| Sleep controller | Bounded queue, timestamps, quality checks, stable-period baseline, LOW/HIGH/event/recovery/fault states |
+| Events and summary | Debounce, duration/oxygen drop, valid/missing monitoring time and research triage |
+| PC sleep ML | 18 sleep-summary features, binary MLP, subject partitions, INT8, masks and modality dropout |
+| PC federation | Checked sample-weighted FedAvg, disjoint sites/subjects, local/global/personalized evaluation |
+| Tests | Host C checks, Python checks, actual PC INT8 golden-vector replay |
+| Real acquisition / board ML | Pending; replay uses **scripted synthetic scores**, model version `NONE` |
+| NPU / M33 / Ethernet | Pending |
 
-## Software Stack
+The application entry point compiles for Cortex-M85 against the initialized
+µT-Kernel headers. A full e2 studio link, board boot and timing measurements have
+not been performed. See [validation notes](docs/VALIDATION.md).
 
-| Layer | Technology |
-|-------|-----------|
-| RTOS | μT-Kernel 3.0 (BSP2, ra_fsp backend) |
-| HAL | Renesas FSP 6.5.0 |
-| Toolchain | GNU ARM Embedded 13.3.1 |
-| IDE | Renesas e2 studio |
+## Run software tests
 
-## Project Status
+Use Python 3.13 and [ml/sleep/requirements.txt](ml/sleep/requirements.txt).
+With a project-local virtual environment, run from the repository root:
 
-- [x] μT-Kernel 3.0 booting on EK-RA8P1
-- [ ] Sensor data collection task
-- [ ] Local ML inference (CMSIS-NN INT8)
-- [ ] UART federation task (inter-board)
-- [ ] FedAvg aggregation
-
-## Repository Structure
-
-```
-Project/
-├── src/
-│   ├── hal_entry.cpp       # FSP entry point — boots μT-Kernel
-│   ├── usermain.c          # μT-Kernel user entry point
-│   └── hal_warmstart.c     # FSP warm start handler
-├── mtk3_bsp2/              # git submodule — μT-Kernel 3.0 BSP2 (tron-forum)
-├── ra/                     # Renesas FSP drivers + CMSIS headers
-├── ra_cfg/                 # FSP pin/clock/peripheral configuration
-├── ra_gen/                 # FSP auto-generated code (do not hand-edit)
-├── script/                 # Linker scripts
-├── configuration.xml       # FSP project configuration (edit via e2 studio GUI)
-└── SETUP_NOTES.md          # Detailed setup history
+```powershell
+.venv/Scripts/python.exe -m ml.sleep.synthesize
+.venv/Scripts/python.exe -m ml.sleep.train_tflite --data ml/sleep/data/synthetic.npz --epochs 2 --allow-synthetic
+.venv/Scripts/python.exe -m ml.sleep.verify
+.venv/Scripts/python.exe -m ml.sleep.federate --data ml/sleep/data/synthetic.npz --rounds 1 --allow-synthetic
+.venv/Scripts/python.exe -m pytest -q tests/test_sleep_ml.py --basetemp .cache/pytest-sleep
+.venv/Scripts/python.exe tests/host/run.py --cc .venv/Lib/site-packages/ziglang/zig.exe --check-arm-entry
 ```
 
-## Getting Started
+Zig is an optional host compiler (`uv pip install ziglang==0.16.0`); firmware
+development still uses the existing e2 studio project. All generated datasets,
+models, environments and caches are ignored. Synthetic metrics establish software
+execution only. [ML instructions and real-data contract](ml/sleep/README.md).
 
-### Prerequisites
+## Board replay
 
-- [Renesas e2 studio](https://www.renesas.com/software-tool/e2studio) (tested: 2025-12)
-- Renesas FSP 6.5.0 (installed via e2 studio)
-- GNU ARM Embedded Toolchain 13.3.1 — install and register in e2 studio via `Help → Renesas Toolchain Management`
-- J-Link debugger (built into EK-RA8P1 via USB)
-- Tera Term or any serial terminal
+Initialize existing dependencies with `git submodule update --init --recursive`.
+Open the existing project in e2 studio, select Debug and follow
+[SETUP_NOTES.md](SETUP_NOTES.md) for FSP 6.5.0 / Arm GCC setup.
+Use `Project Debug_Flat` for CPU0 and serial at 115200 baud, 8N1.
 
-### Clone
+The banner states `SYNTHETIC replay, scripted scores, model=NONE`. The 100-second
+fixture calibrates, triggers an event, recovers, demonstrates missing SpO2 and
+prints a session summary. No trained model or physical sensor produces these
+scores. [DEMO.md](DEMO.md) gives expected behavior.
 
-```bash
-git clone --recursive https://github.com/jntbatra/fedtinyrt.git
+Queue copies use short task-dispatch critical sections; this is not an ISR-safe
+or multicore queue. Acquisition performs no ML, networking or console output.
+The new tasks still require full board validation.
+
+## Repository map
+
+```text
+src/usermain.c          existing entry point, now starts sleep replay tasks
+src/sleep/             portable controller, data contracts and labelled replay
+ml/sleep/              adapted PC training/export/federation pipeline
+ml/legacy_bearing/     preserved historical scripts, artifacts and results
+ml/data/               existing ignored bearing downloads (location retained)
+tests/                 Python checks and host C acceptance harness
+docs/legacy/           archived FoG plans and pre-migration README
+ra/, ra_cfg/, ra_gen/  existing FSP/CMSIS/board configuration
+mtk3_bsp2/             existing pinned µT-Kernel submodule
 ```
 
-`--recursive` fetches the `mtk3_bsp2` submodule automatically.
+The `pre-sleep-pivot` tag preserves the original committed baseline. Your
+uncommitted README is separately archived. Legacy commands now use
+`ml/legacy_bearing/`; raw-data paths still point to `ml/data/`.
 
-If you already cloned without `--recursive`:
-```bash
-git submodule update --init
-```
+## Next integration gate
 
-### Import into e2 studio
+Review a real dataset's modality/subject/label mapping, replace the synthetic NPZ,
+then implement matching waveform preprocessing and CPU INT8 inference on one
+board window. Verify PC/board golden parity and measure latency/RAM before real
+sensor, NPU and M33 integration.
 
-1. `File` → `Open Projects from File System`
-2. Browse to the cloned `fedtinyrt` folder
-3. Click **Finish**
-
-### Build
-
-In e2 studio: `Project` → `Build Project` (or `Ctrl+B`)
-
-> The build will show 4 linker warnings about `_close/_read/_write/_lseek` — these are false positives from newlib stubs and can be ignored. The ELF is built successfully.
-
-### Flash & Run
-
-1. Connect EK-RA8P1 via USB
-2. `Run` → `Debug Configurations` → select `Project Debug` → `Debug`
-3. Press `F8` (Resume) after halt at main
-4. Open serial terminal: **COM port at 115200 baud, 8N1**
-
-Expected output:
-```
-microT-Kernel Version 3.00
-FedTinyRT starting...
-```
-
-## Development Notes
-
-### Adding a new task
-
-Edit `src/usermain.c`:
-
-```c
-#include <tk/tkernel.h>
-#include <tm/tmonitor.h>
-
-LOCAL void my_task(INT stacd, void *exinf)
-{
-    while (1) {
-        tm_printf((UB*)"hello from task\n");
-        tk_dly_tsk(1000);   // sleep 1000ms
-    }
-}
-
-LOCAL T_CTSK ctsk_my = {
-    .itskpri = 10,
-    .stksz   = 1024,
-    .task    = my_task,
-    .tskatr  = TA_HLNG | TA_RNG3,
-};
-
-EXPORT INT usermain(void)
-{
-    ID tskid = tk_cre_tsk(&ctsk_my);
-    tk_sta_tsk(tskid, 0);
-    tk_slp_tsk(TMO_FEVR);
-    return 0;
-}
-```
-
-### Key μT-Kernel APIs
-
-| API | Description |
-|-----|-------------|
-| `tk_cre_tsk(&ctsk)` | Create task, returns task ID |
-| `tk_sta_tsk(id, 0)` | Start task |
-| `tk_dly_tsk(ms)` | Sleep for N milliseconds |
-| `tk_slp_tsk(TMO_FEVR)` | Sleep forever (use in usermain to keep OS alive) |
-| `tm_printf(fmt, ...)` | Debug serial printf (no float support) |
-
-### FSP Configuration
-
-Hardware peripherals (UART, I2C, SPI, timers, pins) are configured via e2 studio's FSP GUI:
-- Open `configuration.xml` in e2 studio
-- Make changes in the Stacks/Pins/Clocks tabs
-- Click `Generate Project Content` — this regenerates files in `ra_gen/`
-- Commit both `configuration.xml` and updated `ra_gen/` files
-
-### Toolchain issue on fresh clone
-
-If build fails with `cortex-m85+nopacbti` error, your GCC version is too old. EK-RA8P1 requires GCC 12+ for Cortex-M85 support. Install GCC 13.x and register it in `Help → Renesas Toolchain Management`.
-
-## Contributing
-
-1. Branch from `main`
-2. Make changes in `src/`
-3. Build and test on hardware
-4. Push and open a pull request
-
-Do not hand-edit files in `ra_gen/` — they are regenerated by FSP.
+[SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md), [KANBAN.md](KANBAN.md) and
+[RFC-001-systems-contract.md](RFC-001-systems-contract.md) describe this migration.
+`scripts/create-issues.sh` remains the historical FoG issue helper; review/update
+it before using its remote actions for the sleep backlog.

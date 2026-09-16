@@ -1,256 +1,2735 @@
-# FedTinyRT — context.md (Ubiquitous Language, strict)
+# FedTinyRT — Development Context
 
-Cyber-physical distributed ML system: per-hospital µT-Kernel 3.0 edge boards detecting
-Parkinson's Freezing-of-Gait, learning on-device, federating **weights only** across hospitals.
-
-**REALITY FILTER.** Claims labeled `[Verified]` (checked against a source this session),
-`[Inference]` (reasoned from verified facts / general docs), `[Unverified]` (not confirmed),
-`[Decision]` (chosen in the grill). Do not treat an `[Inference]` as fact.
-
-**State-naming rule.** Never say "the model" or "the data." Use the exact state name defined in
-§0. Never say "weights" without saying which *payload state*.
+> **Purpose of this file**
+>
+> This file is the authoritative development context for the next phase of **FedTinyRT**. It is written for developers, AI coding agents, reviewers, and contributors who need to understand what already exists, what is obsolete, what the new sleep-apnea direction is, how the embedded/ML/RTOS/adaptive-sensing/personalization/triage/federated-learning pieces fit together, what must change in the existing codebase, and what counts as a successful TRON Programming Contest 2026 prototype.
+>
+> **If another project document conflicts with this file, this file describes the current target unless the executable code proves otherwise.**
 
 ---
 
-## 0. Canonical State Names (use these verbatim)
+# 1. Project Identity
 
-### Model states (one artifact, many states — name the state)
-| State | Definition | Where it lives | Mutable? |
-|-------|------------|----------------|----------|
-| `Float32_Master` | Full-precision trainable model (Keras/TF). Source of truth; the only state that trains and the only state that federates. | PC (full) / M33 (last-layer copy) | yes (training) |
-| `Frozen_Graph` | `Float32_Master` with training ops stripped, weights frozen; still FP32. Inference-only graph. | PC | no |
-| `Quantized_TFLite` | INT8 `.tflite` produced from `Frozen_Graph` via post-training quant or QAT. | PC → MRAM | no |
-| `NPU_Binary` | Vela-compiled Ethos-U55 command stream + INT8 weights (the only state the NPU executes). | MRAM/SRAM | no |
-| `Seed_Model` | Round-0 `Float32_Master`, pretrained on Daphnet (disjoint). | PC/aggregator | frozen at t0 |
-| `Global_Model[r]` | `Float32_Master` after Global Round `r` aggregation. Version-tagged by `r`. | aggregator → all nodes | replaced each round |
-| `Personalized_Model` | `Global_Model[r]` + local last-layer fine-tune. **Never leaves the board.** Used only to make `Quantized_TFLite`→`NPU_Binary` for local screening. | M33→M85 | yes (continuous) |
+**Project name:** FedTinyRT
+**Current target:** Adaptive, personalized, federated edge-AI sleep-apnea screening and triage
+**Target board:** Renesas EK-RA8P1
+**RTOS:** µT-Kernel 3.0
+**Primary contest:** TRON Programming Contest 2026
+**Project type:** Research / contest prototype, not a medical device
 
-### Data states (name the state; raw never leaves the board)
-| State | Definition |
-|-------|------------|
-| `Raw_Window` | 2 s of triaxial accel @100 Hz = 200×3 samples in the DMA ring buffer. Ingested via **I2C DMA** (demo) or **LAN packets from the ESP32 wearable** (production, decision #24). Node-local only. |
-| `Feature_Vector` | Derived from `Raw_Window`: FI-MLP path = Freeze-Index + band-power + stats; CNN path = normalized `Raw_Window` tensor. Board-local only. |
-| `Label` | Ground truth for a window. Demo = dataset annotation (StartHesitation/Turn/Walking→collapsed per Q12b). Production = clinician diagnosis. Board-local only. |
-| `Aggregation_Payload` | The ONLY state that crosses the network: full dense **FP32** weights of the shared layers (see §2). |
+FedTinyRT is evolving from an earlier proof-of-concept that combined:
 
----
+- µT-Kernel boot on the EK-RA8P1,
+- PC-side vibration feature extraction,
+- a small INT8 bearing-fault model,
+- personalization experiments,
+- and PC-side federated averaging.
 
-## 1. Bounded Context: Hardware & NPU
+The new project keeps the valuable systems ideas — real-time embedded inference, personalization, privacy, federation, and heterogeneous compute — but replaces the bearing-fault / Parkinson's-FoG direction with a more complete **sleep-apnea edge-health platform**.
 
-### 1.1 Memory hierarchy (strict — EK-RA8P1 / RA8P1)
-`[Verified — Renesas RA8P1]` unless noted. Distinct tiers, do NOT conflate:
+The new system must not be implemented as "just another classifier." Its value is the **embedded systems architecture**:
 
-| Tier | Size | Role | Volatile |
-|------|------|------|----------|
-| **TCM (M85)** | 256 KB | tightest-latency working set for M85 real-time (ring buffer, hot activations) | yes |
-| **TCM (M33)** | 128 KB | M33 training working set (last-layer grads/optimizer) | yes |
-| **Data SRAM (ECC)** | 1.6 MB | general on-chip data | yes |
-| **SRAM (activations)** | 2 MB | NN intermediate activations / framebuffers | yes |
-| **On-chip MRAM** | 1 MB | code + `Quantized_TFLite`/`NPU_Binary` + weights (non-volatile) | **no** |
-| **External OSPI flash** | 64 MB | bulk storage (datasets for replay demo, logs) | no |
-| **External SDRAM** | 64 MB | bulk working memory | yes |
-
-- **"NPU SRAM" is NOT a separate pool here.** `[Inference]` Ethos-U55 has no large private SRAM; it **streams** INT8 weights + activations from the 2 MB SRAM / TCM via DMA. So the NPU's effective working memory = the shared on-chip SRAM, not a dedicated NPU RAM. `[Unverified — confirm Ethos-U55 local SRAM/cache size on RA8P1.]`
-- **Model-weight budget:** `NPU_Binary` lives in **MRAM (1 MB)**; activations in **SRAM (2 MB)**. Our model is KB-scale → no storage pressure. The real limit is **on-device training memory on M33** (last-layer FP32 + optimizer state must fit M33 TCM 128 KB / SRAM). `[Unresolved — see §4.]`
-
-### 1.2 Compute units
-`[Verified]` **M85 @ 1 GHz + Helium/MVE** · **M33 @ 250 MHz** · **Ethos-U55 @ 500 MHz, 256 GOPS** (`[Inference]` 256-MAC config).
-`[Inference — verify]` NPU is coupled to **M85**; M33 has no NPU/Helium.
-
-### 1.3 Quantization schemes (strict)
-| Scheme | Used for | Notes |
-|--------|----------|-------|
-| **FP32** | `Float32_Master` training (M33 CPU + PC) | Ethos-U55 does NOT train; M85 FPU is single-precision (no FP64). |
-| **INT8** (asymmetric, per-axis for weights) | `Quantized_TFLite` / `NPU_Binary` inference | `[Verified]` Ethos-U55 accelerates INT8 (and INT16). TFLite default int8 scheme. |
-| **FP16** | **NOT USED** | `[Inference]` Ethos-U55 does not accelerate FP16; no benefit. Explicitly excluded. |
-
-`[Decision]` Optional **QAT** (simulate INT8 rounding during FP32 training) if post-training INT8 loses too much AUPRC.
-
-### 1.4 "NPU Offload" — strict definition
-`NPU Offload` = the act where **M85** hands a **Vela-partitioned subgraph** of INT8 ops
-(CONV_2D, DEPTHWISE_CONV_2D, FULLY_CONNECTED, POOL, MEAN, ADD, RELU, SOFTMAX — `[Verified]`
-Vela SUPPORTED_OPS) to the **Ethos-U55 command stream**; the NPU executes it by streaming
-weights/activations from SRAM via DMA; M85 blocks-or-works until the NPU raises completion.
-- Ops that **violate Vela constraints fall back to M85 CPU** (CMSIS-NN), not the NPU. `[Verified]`
-- Offload is **inference-only.** Training (backprop) is never offloaded — runs FP32 on CPU.
-- `[Inference]` M33 cannot issue NPU offload (NPU coupled to M85); M33 training forward/backward is pure CPU. `[Unverified — confirm.]`
-
-### 1.5 Power / thermal envelope
-- `[Decision]` Device class = **clinic assessment tool**, mains-powered, deep-sleeps between patients. NOT a battery wearable → no battery-life claim.
-- `[Verified]` Process = **22ULL (22 nm ultra-low-leakage)** → low static power.
-- `[Decision]` Measure: avg power idle-vs-active; NPU-vs-CPU energy per inference; Ethernet PHY off except sync.
-- **Thermal envelope: `[Unresolved]`** — not characterized; M85 @1 GHz + NPU sustained load thermal behavior unknown. No throttling policy defined.
-
-### 1.6 Connectivity & physical form `[Verified — Renesas]`
-- **No onboard BLE / WiFi / Bluetooth.** RA8P1 has no radio (Renesas wireless = RA6W1/W2, RA4W1 lines).
-  Only wired **Gigabit Ethernet (RGMII) with TSN**.
-- **Physical form (decision #24):** the board is a **desk/cart clinic BASE STATION**, never worn — it is
-  large, has a display, needs mains power, and would be a fall hazard on a patient.
-- **Body-worn sensor front-end (Option A, extension):** a small **ESP32-C3/S3 wearable** (accel + WiFi)
-  clips to the patient's waist, timestamps samples @100 Hz, and streams accel packets over the
-  **hospital LAN** to the base station's **Ethernet IP**. **No radio is added to the RA8P1.**
-- **`Sensor_Ingest` has two modes:** (1) **direct I2C** accel wired to M85 (demo liveness prop / bench);
-  (2) **LAN packet ingest** from the ESP32 wearable (production). Both yield `Raw_Window` on the base
-  station. Long I2C cables to a walking patient are rejected (unreliable + trip hazard).
+1. multimodal biosignal acquisition,
+2. real-time scheduling with µT-Kernel,
+3. adaptive sensing,
+4. signal-quality awareness,
+5. on-device AI inference,
+6. per-user personalization,
+7. overnight triage,
+8. privacy-preserving local processing,
+9. federated improvement across simulated sites,
+10. measurable benefit from the RA8P1 hardware architecture.
 
 ---
 
-## 2. Bounded Context: Federated Learning
+# 2. Reality Filter
 
-### 2.1 Core definitions (strict)
-| Term | Definition |
-|------|------------|
-| **Local Epoch** | One full pass over a hospital's local `Label`led window set during on-device fine-tune. `[Decision]` Fine-tune **last dense layer(s) only**, few epochs, small LR, on **M33** (FP32). |
-| **Global Round `r`** | One **synchronous** cycle: every participating hospital trains `Global_Model[r-1]`→ submits `Aggregation_Payload` → aggregator runs **FedAvg** → emits `Global_Model[r]` → redistributes. `[Decision]` synchronous (aggregator waits for all). |
-| **Aggregation Payload** | `[Decision]` **Full dense FP32 weights** of the shared layers (~KB-scale), sent **once per Global Round**. NOT gradients, NOT sparse, NOT LoRA, NOT INT8. |
-| **Aggregation rule** | `[Decision]` **FedAvg** (equal-weight or sample-count-weighted mean) + cheap sanity filter (reject NaN / absurd-norm payloads). |
-| **Personalization** | Post-aggregation local fine-tune producing `Personalized_Model`; **not** submitted (would pull the global toward one site / risk catastrophic forgetting). |
+Every contributor must distinguish between the following states.
 
-### 2.2 Weight-update format
-- v1 = **full weights** (dense FP32). `[Decision]`
-- `[Unresolved / future]` alternatives: **delta** (`Global_Model[r] − Global_Model[r-1]`) to enable compression + DP; **LoRA adapters** (low-rank) to shrink payload; **sparse/top-k**. None in v1.
+## VERIFIED
+Something already exists in source code, generated configuration, hardware documentation, or a reproduced experiment.
 
-### 2.3 Privacy / security constraints
-- **Hard invariant (refined for the wearable):** a **Node = wearable sensor + base station** (one
-  hospital). Only `Aggregation_Payload` crosses the **federation network** (base-station ↔ base-station,
-  between hospitals). `Raw_Window`/`Feature_Vector`/`Label` **never leave the Node**. Enforced by the
-  **M33 egress gate**. `[Decision]`
-- **Two distinct networks — do not confuse:** (1) **wearable → base station** over the *hospital LAN*
-  (BLE/WiFi/Ethernet, *intra*-Node): raw accel travels here — allowed, local, should be encrypted.
-  (2) **base station ↔ base station** over Ethernet (*inter*-Node): **weights only**. The privacy
-  guarantee is about network (2), not (1).
-- **Threat model:** `[Decision]` the network + other hospitals. On-board M85↔M33 is trusted (so M33 is a *network* gate, not a raw-data enclave — ADR-002).
-- **Differential Privacy:** `[Unresolved / future]` — no DP noise on payloads in v1. If added, switch to delta payloads and calibrate a noise multiplier (ε,δ **undefined**).
-- **Secure Aggregation:** `[Unresolved / future]` — not implemented. v1 trusts the aggregator to see plaintext FP32 payloads.
-- **Consent withdrawal:** `[Decision]` hospital stops future submissions + secure-wipes local `Label`/data; past diffuse influence in `Global_Model` remains (machine-unlearning = future). Defensible: no raw data was ever shared.
+## IMPLEMENTED
+Code exists and is integrated into the current runtime path.
+
+## PLANNED
+We have decided to build it, but it is not yet complete.
+
+## STRETCH
+Useful only after the mandatory vertical slice is stable.
+
+## HISTORICAL
+Belongs to the previous bearing/FoG direction and should not be described as current functionality.
+
+## UNRESOLVED
+A design decision still needs benchmarking or hardware validation.
+
+Do not present PLANNED, STRETCH, HISTORICAL, or UNRESOLVED items as working features.
 
 ---
 
-## 3. Bounded Context: Network & Telemetry
+# 3. Current Repository State
 
-### 3.1 Transport
-`[Decision]` Wired **Ethernet (RGMII, gigabit-capable)**, **offline-first / store-and-forward** via M33.
-Link required only during a sync window; board fully functional disconnected.
+The repository currently has **two mostly separate halves**.
 
-### 3.2 Stale payload / partitioning
-- **Stale Gradient (defined):** an `Aggregation_Payload` computed against `Global_Model[k]` where `k < r-1` (an outdated base). `[Decision]` v1 is **synchronous**, so the aggregator only accepts payloads tagged with the **current round id `r-1`**; mismatched-version payloads are **rejected** (not merged) → stale gradients cannot corrupt the average by construction.
-- **Round versioning:** every `Global_Model[r]` carries a monotonic `round_id`; payloads echo the `round_id` they trained from.
-- **Dropped payload / network partition:** `[Decision — partial]` store-and-forward retransmit on next link-up. **Quorum policy `[Unresolved]`** — undecided whether a round proceeds on a subset if a hospital is unreachable, or blocks until all report. Must resolve before PRD.
+## 3.1 Embedded firmware that already exists
 
-### 3.3 Heartbeat
-`[Unresolved]` — no heartbeat/liveness protocol designed yet. Open: interval, timeout → drop-from-round, who monitors (aggregator polls vs node pushes).
+The EK-RA8P1 project is configured through Renesas FSP / e2 studio.
 
-### 3.4 OTA (Over-The-Air) update
-- **Model-OTA (in scope):** distribution of `Global_Model[r]` weights to M33 → applied to `Float32_Master` → re-quantized to `Quantized_TFLite`→`NPU_Binary` for the M85/NPU. This is the normal federation redistribution.
-- **Firmware-OTA (out of scope v1):** `[Unresolved]` updating the µT-Kernel image / task binaries over the network is **not** designed; only model weights are pushed in v1.
-- **Atomicity `[Unresolved]`:** no defined rollback if a model-OTA apply fails mid-write to MRAM (risk: bricked model). Needs A/B model slots or checksum+rollback.
+The current firmware path is approximately:
 
----
+```text
+Reset
+  ↓
+FSP startup
+  ↓
+generated main()
+  ↓
+hal_entry()
+  ↓
+knl_start_mtkernel()
+  ↓
+usermain()
+  ↓
+print "FedTinyRT starting..."
+  ↓
+sleep forever
+```
 
-## 4. Unresolved Constraints (resolve before PRD)
+What is already useful:
 
-### Hardware
-1. `[Unverified]` **NPU↔core coupling** — is Ethos-U55 attached only to M85? (Assumed yes.) Determines whether M33 can offload.
-2. `[Unverified]` **Boot core / order** — which core boots first and releases the other? Affects init sequence + inter-core bring-up.
-3. `[Unverified]` **Ethos-U55 local SRAM/cache size** — needed to size activation streaming; "NPU SRAM vs main SRAM" boundary assumed shared.
-4. `[Inference, unconfirmed]` **Ethos-U55 MAC count = 256** (from 256 GOPS @ 500 MHz). Confirm from datasheet.
-5. `[Unresolved]` **Low-power mode names + measured idle/active power + thermal** for RA8P1 (Software Standby / Deep Standby assumed from RA family, not confirmed). No thermal throttling policy.
-6. `[Unresolved]` **M33 on-device training memory feasibility** — does last-layer FP32 weights + gradients + optimizer state fit M33 TCM (128 KB) / SRAM at acceptable speed @250 MHz? Not benchmarked.
+- EK-RA8P1 project structure exists.
+- CPU0 / Cortex-M85 is configured.
+- µT-Kernel boots.
+- serial/T-Monitor output works historically.
+- board-generated files exist.
+- FSP/CMSIS support is present.
+- J-Link debug configuration exists.
 
-### Mathematical / ML
-7. `[Unresolved]` **Final model architecture byte size** — depthwise-separable 1D-CNN dimensions not fixed → `Aggregation_Payload` size (~KB) not pinned.
-8. `[Unresolved]` **Label granularity** (Q12b) — binary `freeze`/`no-freeze` vs 4-class; to be benchmarked, affects head shape + payload.
-9. `[Unresolved]` **Unit harmonization** — tdcsfog (m/s²) vs defog (g, 1g=9.81 m/s²) must be converted; canonical unit + resample-to-100 Hz procedure not yet specified/validated.
-10. `[Unresolved]` **FedAvg weighting** — equal vs sample-count weighting not fixed; matters for imbalanced/scarce hospitals.
-11. `[Unverified]` **tdcsfog subject count** (only 833 *files* confirmed) — needed to fix the 4–5 hospital partition sizes.
+What is **not** yet present in the current firmware:
 
-### Distributed systems / security
-12. `[Unresolved]` **Quorum policy** for dropped payloads / partition (§3.2).
-13. `[Unresolved]` **Heartbeat protocol** (§3.3).
-14. `[Unresolved]` **Model-OTA atomicity / rollback** (A/B MRAM slots?) (§3.4).
-15. `[Unresolved / future]` **DP (ε,δ) and Secure Aggregation** — deferred; if required, forces delta payloads.
-16. `[Unverified]` **µT-Kernel 3.0 API names** (`tk_cre_tsk/sem/flg/mbx/cyc`) vs the actual RA8P1 BSP2 headers.
+- real sensor acquisition tasks,
+- multimodal buffers,
+- audio capture pipeline,
+- SpO₂/PPG driver,
+- accelerometer driver,
+- respiratory-effort input,
+- signal alignment,
+- feature extraction for sleep data,
+- TFLite Micro / CMSIS-NN / Ethos-U55 runtime integration,
+- apnea model inference,
+- M33 application,
+- on-device training,
+- Ethernet federation protocol,
+- adaptive sensing,
+- personalization,
+- triage report generation.
 
----
-
-## 5. Revisions (post board-fact verification)
-
-Triggered by verified RA8P1 specs (256 GOPS NPU, M85@1 GHz+Helium, M33@250 MHz no-Helium/NPU,
-TCM 256 KB/128 KB, 2 MB SRAM, 1 MB MRAM, INT8/INT16 NPU, TrustZone, 22ULL).
-
-### 5.1 COMMIT NOW (low-risk wins)
-- **R1 — Right-size the model UP.** Drop the inherited 4 KB target. Use a real depthwise-separable
-  1D-CNN: **grow the frozen conv body (NPU inference, cheap) freely for accuracy; keep the
-  trainable head small.** Reconciles "bigger model" with "weak-M33 training" — only the small head
-  trains on M33, so training cost is bounded regardless of body size. Updates §0/§1.2.
-- **R2 — INT8 default, INT16 fallback.** Ship `Quantized_TFLite` INT8. If INT8 costs real freeze
-  recall (AUPRC), switch to **INT16** (still NPU-accelerated, ~2× size, storage is free). Decided by
-  measurement, not pre-committed. Updates §1.3.
-- **R3 — Helium-accelerated Freeze-Index FFT.** FI-MLP baseline path uses **CMSIS-DSP + Helium/MVE**
-  on M85. Free speed. Updates §1.2.
-- **R4 — A/B model slots in MRAM for safe OTA.** Write new `NPU_Binary` to slot B → verify checksum
-  → atomic switch. Corrupt/interrupted write cannot brick the live model. **Resolves Unresolved #14**
-  (model-OTA atomicity). Storage is free — use it. Updates §3.4.
-
-### 5.2 BENCHMARK GATE (measure before locking)
-- **R5 — M33 training feasibility gates ADR-004.** Plan stays: M33 trains the head concurrently
-  (physical core isolation = cleanest real-time guarantee + best dual-core story). **But gate on one
-  micro-benchmark:** last-layer FP32 epoch time + memory on M33 @250 MHz within 128 KB TCM.
-  - PASS (fits + trains in seconds) → keep ADR-004.
-  - FAIL (won't fit/too slow) → fall back to **M85 idle-slot time-sliced training** (Helium, 4× faster,
-    less "pure parallel" but works). Decide with a number. Ties to Unresolved #6.
-- **R6 — INT8 vs INT16 chosen by AUPRC** on subtle freezes (see R2).
-
-### 5.3 DEFER — least priority, execute only if time remains
-- **R7 — TrustZone-backed egress gate.** Put the weights-only-egress check + payload buffer in M85
-  **secure world** for a hardware-backed privacy story. `[Opinion]` credible bonus, but real work
-  (secure/non-secure partition, veneers, secure-boot). Threat model is network-only, so this is
-  *extra*, not core. **Completion-first beats a half-wired TrustZone.** Do only if v1 is done early.
-- **R8 — Payload size = bookkeeping, not a decision.** `Aggregation_Payload` bytes = (shared-weight
-  count) × 4 (FP32). Falls out once CNN dims are fixed; record it in §2.2 then. Trivial on gigabit
-  RGMII even at tens of KB. No choice to make.
-
-### 5.4 Confirmed role
-- **The board performs PREDICTION.** M85 + Ethos-U55 executes `NPU_Binary` → `freeze/no-freeze`
-  per 2 s window, live, real-time. Training/personalization is the secondary background path (M33).
+The current firmware is therefore a **bring-up foundation**, not the sleep-apnea product.
 
 ---
 
-## Appendix A — Decision log (grill Q1–Q23)
+# 4. Historical ML Work That Must Not Be Confused With the New Target
 
-| # | Decision |
-|---|----------|
-| 1 | Threat model = network + other hospitals; on-board cores trust each other. |
-| 2 | Parallel core split: M85 = sampling + NPU inference (real-time); M33 = last-layer training + comms + privacy gate (concurrent). |
-| 3 | Aggregator = star topology; PC in demo. |
-| 4 | `Aggregation_Payload` = whole FP32 weights, once/round. |
-| 5 | Synchronous Global Rounds. |
-| 6 | Labels: dataset (demo) + clinician (production). |
-| 7 | Hospitals = one dataset split by subject now; real second site later. |
-| 8 | Task = Parkinson's, external I2C accel. |
-| 9 | Success artifact = live single-board loop + offline federation numbers. |
-| 10 | Transport = wired Ethernet, offline-first, store-and-forward via M33. |
-| 11 | Canonical 100 Hz after resampling (tdcsfog 128 / defog 100 / Daphnet 64). |
-| 12 | Task = Freezing-of-Gait; **12b** granularity (binary vs 4-class) = benchmark, open. |
-| 13 | Input window = 2 s, 50% overlap = 200 samples; predict every 1 s. |
-| 14 | Features = hybrid: raw→1D-CNN (device) + Freeze-Index MLP (baseline). |
-| 15 | Device model = depthwise-separable 1D-CNN (INT8, NPU); TCN upgrade; unidir-LSTM available. |
-| 16 | Metric = AUPRC/AP (matches Kaggle mAP) + sensitivity/specificity; accuracy banned. Imbalance: class weights + focal + oversample. Stage a freeze-poor hospital. |
-| 17 | Join = pull current global. Leave = stop + secure-wipe (unlearning future). Bad weights = sanity filter (Byzantine-robust future). |
-| 18 | Two models: global (shared) + personalized (local, never sent). Personalize each round + continuous in production. Last-layer only. |
-| 19 | 4–5 tdcsfog hospitals + defog unseen site; battery = per-hospital/LOHO/cross-site; subject-level splits. |
-| 20 | RTOS tasks: AccelSampler(M85,P1,cyclic+DMA), Inference(M85,P2,NPU), Trainer(M33), FedComms+Gate(M33); inter-core mailbox+HW-sem. Headline: 0 missed sampling deadlines during training. |
-| 21 | Clinic device (mains); measure sleep + NPU-vs-CPU energy + PHY-off; no unmeasured battery claim. |
-| 22 | Cold-start = pretrained seed (Daphnet), disjoint from eval. |
-| 23 | Dataset v1 = Kaggle-only (tdcsfog hospitals + defog unseen) + Daphnet seed; FoG-STAR = extension. |
-| 24 | **Physical form = desk/cart base station (not worn).** Body-worn sensor = **ESP32-C3/S3 wearable → WiFi → hospital LAN → base-station Ethernet** (Option A; no radio added to RA8P1). Node = wearable + base station. Two networks: intra-Node LAN (raw ok) vs inter-Node federation (weights only). Wearable = documented **extension**; demo uses dataset replay + I2C liveness prop. Long I2C cables rejected (unsafe for fall-prone patients). RA8P1 has NO onboard BLE/WiFi. |
+The repository contains PC-side ML code for machine-bearing vibration classification.
 
-## Appendix B — ADRs
-- **ADR-001** — Pivot industrial → cross-silo hospital FoG federation (privacy essential; differentiates from LGX-Shield; keeps ~75% of submitted proposal).
-- **ADR-002** — M33 = network egress gate, not raw-data enclave (TrustZone is intra-core; threat is network-only; avoids enclave paradox).
-- **ADR-003** — Share full model + personalize locally (validated by prior CWRU/IMS; partial-layer sharing = future).
-- **ADR-004** — Parallel core split: M85 inference ∥ M33 training (stronger real-time via physical isolation; M33 slower → last-layer only; NPU coupled to M85).
+Historical pipeline:
 
-## Appendix C — Honest positioning
-- **Claim:** first FoG federated-learning realization on µT-Kernel + dual-core + Ethos-U55 NPU + on-device training; an experiment on whether cross-silo FedAvg + personalization closes the cross-hospital gap FOGSense left as future work, with a measured real-time guarantee.
-- **Do NOT claim:** inventing FoG detection or FL; that federation "fixes/guarantees/ensures" anything; any clinical validity. Simulation, not a clinical device.
+```text
+NASA IMS / CWRU vibration files
+        ↓
+2048-sample windows
+        ↓
+38 handcrafted features
+        ↓
+small MLP
+        ↓
+normal / degrading / fault
+```
+
+Historical assets include:
+
+- feature extraction,
+- grouped train/test logic,
+- INT8 export,
+- golden vectors,
+- C model arrays,
+- cross-machine evaluation,
+- personalization,
+- FedAvg simulation.
+
+These are valuable references for:
+
+- data splitting,
+- quantization,
+- model export,
+- golden-vector validation,
+- personalization mechanics,
+- federation mechanics,
+- experiment organization.
+
+However:
+
+> **The 38 bearing features and the 3-class bearing model are not part of the new sleep-apnea model.**
+
+Do not reuse them as if they were medically meaningful.
+
+The old ML scripts should be kept temporarily under a clearly marked legacy/historical path until the new sleep pipeline is stable.
+
+Recommended migration:
+
+```text
+ml/
+├── legacy_bearing/
+│   ├── feature_extract.py
+│   ├── train_tflite.py
+│   ├── federate.py
+│   ├── personalize.py
+│   └── ...
+│
+└── sleep/
+    └── new implementation
+```
+
+Do not destroy historical code before the new pipeline has working replacements.
+
+---
+
+# 5. New Product Goal
+
+The new contest target is:
+
+> **A privacy-preserving bedside/home sleep screening and triage system that combines multiple physiological signals, detects suspicious sleep-disordered breathing locally on the EK-RA8P1, adapts sensing intensity when an event is suspected, personalizes to the user's baseline, and improves across simulated sites through federated learning.**
+
+This is a **screening prototype**, not a diagnostic medical device.
+
+The system should be able to demonstrate:
+
+```text
+Person / public PSG replay
+        ↓
+multimodal signals
+        ↓
+µT-Kernel real-time acquisition
+        ↓
+signal-quality validation
+        ↓
+adaptive sensing controller
+        ↓
+multimodal AI inference
+        ↓
+event detection
+        ↓
+personalized severity / triage summary
+        ↓
+optional federated update flow
+```
+
+---
+
+# 6. Clinical / Problem Framing
+
+The prototype focuses on sleep-disordered breathing, especially obstructive-sleep-apnea-like events.
+
+The device should not merely output:
+
+```text
+APNEA = TRUE
+```
+
+It should reason from several pieces of evidence and produce a more meaningful event description.
+
+Example output:
+
+```text
+Possible respiratory event
+
+Confidence: 0.91
+Duration: 24 s
+SpO₂: 97% → 89%
+Respiratory effort: continued
+Airflow/breathing signal: reduced
+Movement: low
+Signal quality: good
+```
+
+The nightly system should summarize:
+
+- monitoring duration,
+- number of suspicious events,
+- event frequency,
+- longest event,
+- minimum SpO₂,
+- oxygen-desaturation burden,
+- signal quality,
+- model confidence,
+- and a simple research triage category.
+
+Recommended wording:
+
+```text
+LOW
+MODERATE
+HIGH
+```
+
+The output must be described as a **research triage/screening score**, not a clinical diagnosis.
+
+---
+
+# 7. Core Product Features
+
+The contest system has seven core features.
+
+## 7.1 Multimodal sensing
+
+The device should combine multiple complementary signals.
+
+Preferred v1 modalities:
+
+1. SpO₂ / PPG
+2. respiratory effort
+3. breathing/snoring audio
+4. body movement / sleep position
+
+Optional:
+
+5. nasal airflow
+6. ECG
+
+The system should not require every modality to be present to run.
+
+---
+
+## 7.2 Adaptive sensing
+
+The system should operate in two main modes.
+
+### LOW-DETAIL MODE
+
+Used when signals appear normal.
+
+Typical active work:
+
+- low-rate SpO₂/PPG monitoring,
+- respiratory-effort monitoring,
+- movement monitoring,
+- lightweight quality checks,
+- lightweight trigger logic.
+
+### HIGH-DETAIL MODE
+
+Activated when a suspicious change appears.
+
+Possible triggers:
+
+- respiratory amplitude drops,
+- SpO₂ starts trending down,
+- unusual breath-sound change,
+- repeated irregular breathing,
+- event probability from lightweight detector,
+- combination of weak signals.
+
+High-detail mode may enable:
+
+- higher-frequency processing,
+- audio feature extraction,
+- full multimodal inference,
+- detailed event logging.
+
+The important systems concept is:
+
+> The board should not spend maximum compute and privacy budget continuously if high-detail processing is only needed around suspicious events.
+
+Adaptive sensing must be implemented as a real state machine, not only described in slides.
+
+Suggested states:
+
+```text
+IDLE
+  ↓
+MONITORING_LOW
+  ↓ suspicious trigger
+MONITORING_HIGH
+  ↓ run inference
+EVENT_ACTIVE
+  ↓ event ends
+RECOVERY
+  ↓
+MONITORING_LOW
+```
+
+Additional states:
+
+```text
+SENSOR_FAULT
+SESSION_END
+```
+
+---
+
+## 7.3 Signal-quality awareness
+
+A medical-signal prototype must know when its input is unreliable.
+
+The system should track quality per modality.
+
+Examples:
+
+### SpO₂/PPG quality problems
+
+- finger sensor disconnected,
+- no pulse waveform,
+- impossible SpO₂ jump,
+- excessive motion.
+
+### Respiratory sensor quality problems
+
+- flatline,
+- clipping,
+- disconnected belt,
+- impossible amplitude jump.
+
+### Audio quality problems
+
+- microphone saturated,
+- no microphone stream,
+- strong environmental noise.
+
+### Accelerometer quality problems
+
+- stream stopped,
+- constant values,
+- bus fault.
+
+Output per modality:
+
+```text
+liveness = true/false
+quality_score = 0.0 ... 1.0
+```
+
+Model policy:
+
+```text
+If critical modalities are unreliable:
+    do not confidently emit "normal"
+```
+
+Allowed outputs:
+
+```text
+NORMAL
+SUSPICIOUS_EVENT
+UNCERTAIN
+SENSOR_FAULT
+```
+
+This is important.
+
+---
+
+# 8. Personalization
+
+Personalization should remain simple for contest v1.
+
+Do **not** make full on-device neural-network retraining a prerequisite.
+
+The v1 personalization layer should learn a user's baseline from an initial stable period.
+
+Possible baseline values:
+
+- median SpO₂,
+- SpO₂ variance,
+- resting pulse,
+- respiratory rate,
+- respiratory amplitude,
+- motion profile,
+- snoring/breathing feature statistics.
+
+Example:
+
+```text
+baseline_spo2 = 97.1
+baseline_hr = 63
+baseline_resp_rate = 14.5
+baseline_resp_amp = 0.62
+```
+
+Features fed to the AI may use deviations from baseline:
+
+```text
+delta_spo2
+normalized_resp_amp
+relative_hr_change
+motion_relative_to_baseline
+```
+
+This gives a meaningful personalization story:
+
+```text
+global model
+     +
+individual baseline
+     ↓
+personalized decision context
+```
+
+Stretch personalization:
+
+- fine-tune only the classifier head,
+- keep modality encoders frozen,
+- maintain both global and personalized model copies.
+
+---
+
+# 9. Triage Layer
+
+The device should not stop at event classification.
+
+Each accepted event should be converted into structured event metadata.
+
+Recommended event record:
+
+```json
+{
+  "event_id": 42,
+  "start_ms": 8452000,
+  "end_ms": 8476000,
+  "duration_s": 24.0,
+  "model_score": 0.91,
+  "signal_quality": 0.94,
+  "spo2_before": 97,
+  "spo2_min": 89,
+  "spo2_drop": 8,
+  "resp_effort_score": 0.73,
+  "movement_score": 0.08,
+  "audio_score": 0.81,
+  "event_type": "suspicious_respiratory_event"
+}
+```
+
+At session end compute:
+
+```text
+monitoring_duration
+valid_monitoring_duration
+event_count
+events_per_hour
+longest_event
+minimum_spo2
+mean_spo2_drop
+time_below_selected_spo2_ranges
+oxygen-burden-style metric
+average signal quality
+fraction of session with missing sensors
+```
+
+Triage can combine these values into:
+
+```text
+LOW
+MODERATE
+HIGH
+```
+
+This is not a validated clinical score.
+
+The purpose is to demonstrate **meaningful home screening and prioritization**.
+
+---
+
+# 10. Multimodal Inputs and Hardware Paths
+
+The target board is the Renesas EK-RA8P1.
+
+## 10.1 Audio
+
+Source:
+
+```text
+onboard PDM MEMS microphone
+```
+
+Signals:
+
+- snoring,
+- breathing sounds,
+- gasps,
+- pauses,
+- arousal-like acoustic changes.
+
+Processing:
+
+```text
+PDM samples
+   ↓
+audio frames
+   ↓
+filter / optional downsample
+   ↓
+log-mel / FFT-style features
+   ↓
+audio encoder
+```
+
+Audio must be processed locally.
+
+Recommended privacy policy:
+
+```text
+raw bedroom audio is not exported
+```
+
+Contest implementation may optionally avoid persistent raw-audio storage.
+
+---
+
+## 10.2 SpO₂ / PPG
+
+External pulse-oximeter module.
+
+Exact part number is still unresolved.
+
+Preferred interface:
+
+```text
+I²C
+```
+
+Signals:
+
+- SpO₂,
+- raw PPG if available,
+- pulse rate,
+- pulse waveform quality.
+
+Use:
+
+- oxygen desaturation,
+- heart-rate response,
+- event severity,
+- personal baseline.
+
+Candidate module examples may be evaluated later, but do not hard-code a part number until bench-tested.
+
+---
+
+## 10.3 Respiratory effort
+
+Preferred:
+
+- respiratory belt,
+- stretch sensor,
+- pressure/effort sensor,
+- or another simple chest/abdomen effort sensor.
+
+Possible interface:
+
+```text
+ADC
+or
+I²C/SPI module
+```
+
+Use:
+
+- respiration waveform,
+- respiratory rate,
+- effort amplitude,
+- event onset,
+- persistence of effort during airflow reduction.
+
+This is a high-value modality.
+
+---
+
+## 10.4 Accelerometer
+
+Preferred external 3-axis accelerometer.
+
+Interface:
+
+```text
+I²C or SPI
+```
+
+Use:
+
+- body position,
+- motion artifact detection,
+- sleep posture,
+- respiratory/chest motion if sensor placement allows,
+- quality gating.
+
+---
+
+## 10.5 Optional nasal airflow
+
+Possible hardware:
+
+- thermistor,
+- pressure sensor,
+- airflow front end.
+
+Possible interface:
+
+```text
+ADC
+```
+
+Use:
+
+- direct airflow evidence.
+
+This is useful but should not delay the mandatory system.
+
+---
+
+## 10.6 Optional ECG
+
+Possible hardware:
+
+- ECG analog front end,
+- ADC input.
+
+Use:
+
+- additional cardiac context,
+- future extension.
+
+Not required for contest v1.
+
+---
+
+# 11. RA8P1 Compute Allocation
+
+The new architecture should deliberately use the board rather than treating it as a generic MCU.
+
+## 11.1 Cortex-M85 — primary real-time core
+
+Responsibilities:
+
+- µT-Kernel execution,
+- sensor drivers,
+- DMA/ring-buffer management,
+- stream timestamps,
+- signal preprocessing,
+- audio DSP,
+- modality synchronization,
+- signal-quality monitoring,
+- adaptive-sensing state machine,
+- event manager,
+- invocation of NPU inference,
+- display / live telemetry,
+- benchmark timers,
+- deadline-miss counters.
+
+The M85 owns **hard real-time correctness**.
+
+Sensor acquisition must never depend on ML inference finishing in time.
+
+---
+
+## 11.2 Ethos-U55 NPU — inference accelerator
+
+Responsibilities:
+
+- forward inference for the quantized multimodal model,
+- INT8/INT16 network execution where supported.
+
+The NPU does:
+
+```text
+inference
+```
+
+The NPU does not do:
+
+```text
+backpropagation
+full training
+FedAvg
+sensor acquisition
+```
+
+Fallback:
+
+If some model operation is not supported by the NPU toolchain, either:
+
+1. redesign the network,
+2. allow supported CPU fallback,
+3. or temporarily run the complete v1 model on M85 until the NPU version is stable.
+
+The project must first achieve **correct M85 inference** before making the entire prototype dependent on NPU integration.
+
+---
+
+## 11.3 Cortex-M33 — background core
+
+Target responsibilities:
+
+- background classifier-head training,
+- federation client,
+- update packaging,
+- network communication,
+- model storage coordination,
+- privacy/egress policy.
+
+However:
+
+> M33 integration is not allowed to block the first working vertical slice.
+
+If dual-core support becomes risky, contest v1 may run federation/training externally while still documenting M33 as the intended next integration stage.
+
+---
+
+# 12. Memory Allocation
+
+Target usage:
+
+## M85 TCM
+
+Use for:
+
+- highest-rate ring buffers,
+- audio working buffers,
+- hottest DSP scratch,
+- latency-critical shared state.
+
+## M33 TCM
+
+Future / stretch:
+
+- trainable classifier head,
+- gradients,
+- optimizer state,
+- micro-batch buffers.
+
+## 2 MB on-chip SRAM
+
+Use for:
+
+- NPU activation arena,
+- modality feature tensors,
+- aligned inference windows,
+- model working buffers,
+- event state.
+
+## 64 MB external SDRAM
+
+Use for:
+
+- longer replay windows,
+- buffered demo data,
+- event/feature history,
+- session summary state.
+
+## 64 MB OSPI flash
+
+Use for:
+
+- public-dataset replay clips,
+- test vectors,
+- calibration blobs,
+- stored model artifacts,
+- event logs if needed.
+
+## 1 MB MRAM
+
+Use for:
+
+- firmware,
+- model metadata,
+- potentially A/B model slots.
+
+Do not promise atomic OTA model switching until implemented and tested.
+
+---
+
+# 13. µT-Kernel Task Architecture
+
+µT-Kernel must be visibly important to the project.
+
+Suggested task model:
+
+```text
+High priority
+│
+├── sensor_audio_task
+├── sensor_ppg_task
+├── sensor_resp_task
+├── sensor_accel_task
+│
+├── time_sync_task
+├── quality_task
+│
+├── adaptive_controller_task
+│
+├── inference_task
+│
+├── event_manager_task
+│
+├── ui_task
+│
+└── federation_task
+Low priority
+```
+
+Actual priorities must be measured and tuned.
+
+Recommended responsibility split:
+
+## sensor_* tasks
+
+- initialize hardware,
+- read samples,
+- timestamp samples,
+- write to ring buffers,
+- never perform heavy model work.
+
+## time_sync_task
+
+Align modalities from different sampling rates onto a common analysis window.
+
+## quality_task
+
+Compute modality health and quality metrics.
+
+## adaptive_controller_task
+
+Switch between low-detail and high-detail modes.
+
+## inference_task
+
+Prepare the aligned tensor and invoke the ML runtime.
+
+## event_manager_task
+
+- debounce predictions,
+- start/end events,
+- calculate duration,
+- calculate oxygen drop,
+- persist event metadata.
+
+## ui_task
+
+Update:
+
+- display,
+- serial monitor,
+- LEDs,
+- debug telemetry.
+
+## federation_task
+
+Lowest priority.
+
+Must never cause sensor deadlines to be missed.
+
+---
+
+# 14. Timing Model
+
+Inputs will operate at very different rates.
+
+Example order of magnitude:
+
+```text
+audio:         kHz range
+accelerometer: tens to hundreds of Hz
+resp effort:   tens of Hz
+PPG:           tens/hundreds of Hz if raw
+SpO₂ summary:  ~1 Hz class of output
+```
+
+Exact sampling rates are unresolved and must be selected after hardware validation.
+
+Each signal should have:
+
+```text
+timestamp
+sample/value
+quality
+source
+```
+
+The M85 should maintain separate ring buffers.
+
+Example:
+
+```text
+audio_ring
+ppg_ring
+spo2_ring
+resp_ring
+accel_ring
+```
+
+Inference windows should be created from a common time interval.
+
+Candidate window:
+
+```text
+30 s
+```
+
+or:
+
+```text
+60 s
+```
+
+Possibly with overlap.
+
+Do not lock epoch length until dataset experiments compare latency, AUPRC, memory, and compute cost.
+
+---
+
+# 15. New ML Pipeline
+
+The new ML pipeline must live separately from the historical bearing pipeline.
+
+Recommended layout:
+
+```text
+ml/sleep/
+├── datasets/
+├── preprocess/
+├── features/
+├── models/
+├── training/
+├── eval/
+├── quantization/
+├── federation/
+├── personalization/
+├── export/
+└── artifacts/
+```
+
+---
+
+# 16. Dataset Strategy
+
+Use public, labeled sleep datasets for training and replay.
+
+Potential sources include public polysomnography / sleep-apnea datasets such as:
+
+- Apnea-ECG,
+- UCD / St. Vincent's sleep datasets,
+- MESA,
+- SHHS,
+- other accessible public PSG datasets.
+
+Do not mix datasets casually.
+
+Required dataset work:
+
+1. define which modalities are available in each dataset,
+2. define subject IDs,
+3. define event labels,
+4. harmonize labels,
+5. define common sampling rates,
+6. define train/validation/test subjects,
+7. prevent subject leakage,
+8. define simulated hospital partitions.
+
+Critical rule:
+
+> **Never randomly split overlapping epochs from the same subject across train and test.**
+
+Evaluation must be subject-grouped.
+
+---
+
+# 17. Label Strategy
+
+Contest v1 should prioritize:
+
+```text
+normal
+vs
+suspicious apnea/hypopnea event
+```
+
+Avoid starting with a complicated multi-class sleep-disease taxonomy.
+
+Possible future classes:
+
+```text
+normal
+obstructive-like
+central-like
+hypopnea-like
+uncertain
+```
+
+But binary event detection is the safer first target.
+
+---
+
+# 18. Feature / Model Strategy
+
+Do not reuse the old 38 bearing features.
+
+New model inputs should come from sleep modalities.
+
+Two acceptable v1 approaches:
+
+## Option A — feature-based fusion
+
+For each modality derive compact features.
+
+Examples:
+
+### SpO₂ / PPG
+
+- current SpO₂,
+- baseline-relative SpO₂,
+- slope,
+- desaturation depth,
+- rolling variance,
+- pulse rate,
+- pulse-rate change,
+- PPG quality.
+
+### respiratory effort
+
+- amplitude,
+- respiratory rate,
+- zero-crossing / cycle features,
+- effort reduction,
+- baseline-relative effort,
+- variance.
+
+### accelerometer
+
+- activity magnitude,
+- orientation,
+- motion score,
+- posture category.
+
+### audio
+
+- log-mel features,
+- spectral energy,
+- snoring probability,
+- breathing-sound probability.
+
+Then concatenate:
+
+```text
+[SpO₂ features]
+      +
+[respiration features]
+      +
+[motion features]
+      +
+[audio features]
+      ↓
+small MLP / temporal head
+```
+
+This is easiest for fast embedded integration.
+
+---
+
+## Option B — small per-modality encoders + late fusion
+
+Example:
+
+```text
+audio window
+  ↓
+tiny 1D CNN
+  ↓
+audio embedding
+              \
+SpO₂ sequence  \
+  ↓             \
+small temporal   \
+encoder           \
+                   → concatenate → dense head → event score
+resp sequence     /
+  ↓              /
+small encoder   /
+               /
+accel sequence
+  ↓
+small encoder
+```
+
+This is more powerful, but more difficult to integrate.
+
+Recommended development sequence:
+
+```text
+feature-based model first
+        ↓
+working embedded inference
+        ↓
+then attempt tiny late-fusion encoders
+```
+
+Do not sacrifice the working prototype for a more sophisticated architecture.
+
+---
+
+# 19. Missing-Modality Robustness
+
+The system must not break if one sensor disappears.
+
+Training should include modality dropout.
+
+Example:
+
+```python
+during training:
+    randomly zero or mask one modality
+```
+
+Model inputs should include modality-presence masks.
+
+Example:
+
+```text
+audio_present
+spo2_present
+resp_present
+accel_present
+```
+
+Inference should distinguish:
+
+```text
+missing sensor
+```
+
+from:
+
+```text
+true zero signal
+```
+
+If a critical stream fails:
+
+```text
+prediction_status = UNCERTAIN
+```
+
+instead of:
+
+```text
+prediction = NORMAL
+```
+
+This feature is important for real-world credibility.
+
+---
+
+# 20. Quantization and Embedded Export
+
+The final contest model should target quantized inference.
+
+Preferred first target:
+
+```text
+INT8
+```
+
+Pipeline:
+
+```text
+trained model
+    ↓
+representative calibration data
+    ↓
+full-integer quantization
+    ↓
+TFLite / compatible artifact
+    ↓
+NPU toolchain / Vela where supported
+    ↓
+embedded model artifact
+```
+
+Maintain:
+
+```text
+input scale
+input zero point
+output scale
+output zero point
+```
+
+Create golden vectors.
+
+Each golden vector should contain:
+
+```text
+input features/tensor
+expected quantized input
+expected output logits/probability
+expected class
+```
+
+Mandatory validation:
+
+```text
+PC float model
+vs
+PC INT8 model
+vs
+board inference
+```
+
+Outputs must match within defined tolerance.
+
+---
+
+# 21. Golden-Vector Test Strategy
+
+This worked well in the historical bearing pipeline and should be preserved.
+
+Recommended artifact:
+
+```text
+ml/sleep/artifacts/golden_vectors.json
+```
+
+Include examples of:
+
+- normal epoch,
+- apnea epoch,
+- borderline epoch,
+- low-signal-quality epoch,
+- missing-modality epoch.
+
+Firmware test mode:
+
+```text
+load golden vector
+      ↓
+run preprocessing
+      ↓
+run inference
+      ↓
+compare output
+      ↓
+PASS / FAIL
+```
+
+This becomes the bridge between ML and firmware teams.
+
+---
+
+# 22. Adaptive-Sensing Logic
+
+Adaptive sensing must be implemented separately from the heavy model.
+
+Recommended first trigger:
+
+```text
+if respiration amplitude falls sharply
+OR SpO₂ trend becomes suspicious
+OR lightweight event score > threshold
+    switch to HIGH_DETAIL
+```
+
+Pseudocode:
+
+```text
+MONITORING_LOW:
+    sample baseline streams
+    update signal quality
+    update cheap trigger
+
+    if trigger:
+        enter MONITORING_HIGH
+
+MONITORING_HIGH:
+    enable extra processing
+    compute full features
+    run multimodal model
+
+    if event_score high:
+        enter EVENT_ACTIVE
+    else if timeout:
+        return MONITORING_LOW
+
+EVENT_ACTIVE:
+    keep high-detail processing
+    accumulate event metadata
+
+    if event ends:
+        finalize event
+        enter RECOVERY
+
+RECOVERY:
+    wait short stabilization period
+    return MONITORING_LOW
+```
+
+This state machine should have unit tests.
+
+---
+
+# 23. Overnight Triage Logic
+
+The final report should aggregate accepted events.
+
+Suggested data structure:
+
+```c
+typedef struct {
+    uint32_t total_valid_seconds;
+    uint32_t event_count;
+    float events_per_hour;
+    float longest_event_seconds;
+    float minimum_spo2;
+    float mean_spo2_drop;
+    float oxygen_burden_score;
+    float mean_signal_quality;
+    float valid_data_fraction;
+    uint8_t triage_level;
+} sleep_session_summary_t;
+```
+
+The triage level may be based on a simple research scoring function.
+
+Example:
+
+```text
+risk_score =
+    event_frequency_weight
+  + oxygen_drop_weight
+  + duration_weight
+  + low_spo2_time_weight
+  + confidence_weight
+```
+
+Do not call the resulting score clinically validated.
+
+---
+
+# 24. Explainable Event Output
+
+The prototype should explain **why** it flagged an event.
+
+This does not require SHAP on-device.
+
+Use rule-based post-inference evidence.
+
+Example:
+
+```text
+Possible respiratory event
+
+Main evidence:
+- breathing effort reduced 62%
+- SpO₂ dropped 7%
+- snoring/breathing acoustic score changed
+- movement low
+- signal quality high
+```
+
+This gives interpretable output without adding a second expensive model.
+
+---
+
+# 25. Federated Learning
+
+Federated learning remains a core architectural feature.
+
+Contest v1 should use a **PC-side federation simulator** first.
+
+Each simulated hospital contains different subjects.
+
+Example:
+
+```text
+Hospital A → subjects 01–10
+Hospital B → subjects 11–20
+Hospital C → subjects 21–30
+Hospital D → subjects 31–40
+```
+
+Each site:
+
+1. receives global weights,
+2. trains locally,
+3. keeps raw subject data local,
+4. sends only the permitted model update,
+5. server aggregates,
+6. receives updated global model.
+
+Basic aggregation:
+
+```text
+FedAvg
+```
+
+Metrics:
+
+- local-only AUPRC,
+- global federated AUPRC,
+- sensitivity,
+- specificity,
+- per-site performance,
+- leave-one-site-out performance,
+- personalized performance after local adaptation.
+
+Do not make claims that federation inherently improves all sites.
+
+Measure it.
+
+---
+
+# 26. Federation Payload
+
+Recommended first payload:
+
+```json
+{
+  "round_id": 3,
+  "client_id": "hospital_b",
+  "sample_count": 1842,
+  "model_version": "sleep-v1",
+  "shared_weights": "...",
+  "metrics": {
+    "local_loss": 0.31
+  }
+}
+```
+
+Server validation:
+
+- expected round,
+- expected tensor shapes,
+- reject NaN/Inf,
+- reject corrupted payloads,
+- reject impossible weight norms.
+
+Contest v1 may serialize with a simple binary or NumPy format.
+
+A production-grade federation protocol is out of scope.
+
+---
+
+# 27. What Should Federate?
+
+Preferred architecture:
+
+```text
+modality encoders
+    mostly frozen
+
+fusion / classifier head
+    trainable
+```
+
+Then federate the small shared head.
+
+Advantages:
+
+- smaller payload,
+- easier on-device adaptation,
+- less memory,
+- faster local training,
+- easier M33 future integration.
+
+If the v1 model is a simple MLP, federate the entire small model first.
+
+Do not over-engineer until measured.
+
+---
+
+# 28. On-Device Training
+
+On-device training on M33 is a **stretch integration goal**, not the first milestone.
+
+If implemented:
+
+- only train a tiny head,
+- use FP32 or a carefully supported training format,
+- micro-batches only,
+- strict memory budget,
+- low-priority scheduling,
+- never interfere with M85 sensor deadlines.
+
+Required proof before claiming it:
+
+```text
+0 missed sensor deadlines during background training
+```
+
+If this cannot be demonstrated, move training to a host-side simulation and describe M33 training as planned future work.
+
+---
+
+# 29. Privacy Model
+
+Contest privacy rule:
+
+```text
+raw biosignal waveforms stay local by default
+```
+
+Raw data that should not leave the node in the intended architecture:
+
+- microphone audio,
+- PPG waveform,
+- respiration waveform,
+- accelerometer waveform,
+- subject labels.
+
+Allowed outbound data:
+
+- aggregated session summary,
+- debug data during development,
+- model updates during federation,
+- benchmark metadata.
+
+For the contest development environment, debugging may temporarily export raw data.
+
+Document when debug mode differs from the intended privacy model.
+
+---
+
+# 30. Board I/O Usage
+
+Target board interfaces:
+
+## PDM microphone
+
+```text
+audio input
+```
+
+## I²C / SPI / expansion headers
+
+```text
+SpO₂ / PPG
+accelerometer
+other digital sensors
+```
+
+## ADC / Arduino analog pins
+
+```text
+respiratory effort
+optional airflow
+optional ECG
+```
+
+## Ethernet
+
+```text
+federation / model-update transport
+```
+
+## MIPI display
+
+```text
+live clinician / demo dashboard
+```
+
+## USB
+
+```text
+session export
+benchmark dump
+development
+```
+
+## UART / J-Link / RTT
+
+```text
+debug logs
+deadline metrics
+timing
+```
+
+## LEDs / buttons
+
+```text
+recording
+liveness
+event / error indication
+start / stop session
+```
+
+---
+
+# 31. Pin / Peripheral Constraints
+
+Important board constraints must be respected.
+
+Known planning issues include:
+
+- OSPI and some expansion interfaces share pins through board switching.
+- parallel display and parallel camera paths conflict.
+- some headers may be unpopulated.
+- the exact active pin configuration must be verified in the generated FSP pin configuration before wiring.
+
+Do not assume a board connector is usable just because it physically exists.
+
+Before adding a sensor:
+
+1. inspect `bsp_pin_cfg.h`,
+2. inspect `configuration.xml`,
+3. verify switch/jumper configuration,
+4. create driver instance in FSP if required,
+5. regenerate code,
+6. test the peripheral in isolation.
+
+---
+
+# 32. Display / Demo UI
+
+The demo UI should show only useful information.
+
+Recommended live view:
+
+```text
+FedTinyRT Sleep
+
+SpO₂: 96%
+Pulse: 71 bpm
+Respiration: 14/min
+Position: Supine
+
+Signal quality:
+SpO₂      GOOD
+Resp      GOOD
+Audio     GOOD
+Motion    GOOD
+
+Mode:
+HIGH-DETAIL
+
+Event probability:
+0.87
+
+Status:
+POSSIBLE RESPIRATORY EVENT
+```
+
+Nightly summary:
+
+```text
+Session: 6 h 42 m
+Valid data: 94%
+
+Events: 42
+Events/hour: 6.3
+Longest event: 29 s
+Minimum SpO₂: 87%
+Oxygen burden: elevated
+
+Research triage:
+MODERATE
+
+Recommendation:
+Consider formal sleep evaluation.
+```
+
+No unsupported medical claim.
+
+---
+
+# 33. Metrics
+
+Do not use ordinary accuracy as the headline metric.
+
+Primary ML metrics:
+
+- AUPRC / average precision,
+- sensitivity / recall,
+- specificity,
+- AUROC as secondary,
+- per-subject metrics,
+- per-site metrics.
+
+Session-level metrics:
+
+- event-count error,
+- event timing error,
+- approximate events/hour error,
+- oxygen-burden correlation/error where applicable.
+
+Embedded metrics:
+
+- feature/preprocessing latency,
+- inference latency,
+- full pipeline latency,
+- RAM usage,
+- flash/model size,
+- CPU load,
+- NPU load if measurable,
+- sensor deadline misses,
+- jitter,
+- energy/power if measurable.
+
+Key systems metric:
+
+```text
+sensor deadline misses = 0
+```
+
+during normal inference.
+
+---
+
+# 34. CPU vs NPU Benchmark
+
+To prove the RA8P1 matters, run the same quantized model in two modes if possible:
+
+```text
+Mode A:
+M85 CPU inference
+
+Mode B:
+Ethos-U55 inference
+```
+
+Compare:
+
+- inference latency,
+- CPU occupancy,
+- sensor jitter,
+- missed deadlines,
+- throughput,
+- energy if available.
+
+Do not use Renesas marketing benchmark numbers as project results.
+
+Only report measured FedTinyRT values.
+
+---
+
+# 35. Recommended Repository Restructure
+
+Target structure:
+
+```text
+fedtinyrt/
+│
+├── src/
+│   ├── app/
+│   │   ├── app_main.c
+│   │   ├── session_manager.c
+│   │   ├── adaptive_controller.c
+│   │   ├── event_manager.c
+│   │   └── triage.c
+│   │
+│   ├── sensors/
+│   │   ├── audio_pdm.c
+│   │   ├── spo2_ppg.c
+│   │   ├── respiration.c
+│   │   ├── accelerometer.c
+│   │   └── sensor_quality.c
+│   │
+│   ├── dsp/
+│   │   ├── audio_features.c
+│   │   ├── ppg_features.c
+│   │   ├── respiration_features.c
+│   │   ├── motion_features.c
+│   │   └── window_sync.c
+│   │
+│   ├── ml/
+│   │   ├── inference.c
+│   │   ├── model_data.c
+│   │   ├── model_data.h
+│   │   ├── quantization.c
+│   │   └── golden_test.c
+│   │
+│   ├── federation/
+│   │   ├── federation_client.c
+│   │   └── model_update.c
+│   │
+│   ├── ui/
+│   │   ├── display.c
+│   │   └── telemetry.c
+│   │
+│   └── usermain.c
+│
+├── ml/
+│   ├── legacy_bearing/
+│   │
+│   └── sleep/
+│       ├── datasets/
+│       ├── preprocess/
+│       ├── features/
+│       ├── models/
+│       ├── training/
+│       ├── eval/
+│       ├── quantization/
+│       ├── federation/
+│       ├── personalization/
+│       ├── export/
+│       └── artifacts/
+│
+├── tests/
+│   ├── host/
+│   └── golden/
+│
+├── docs/
+│   ├── PROJECT_BRIEF.md
+│   ├── HARDWARE.md
+│   ├── MODEL_CARD.md
+│   └── FEDERATION.md
+│
+└── context.md
+```
+
+This structure is a recommendation, not a requirement.
+
+---
+
+# 36. Migration Plan From Current Code
+
+Do not rewrite everything at once.
+
+## Phase 0 — preserve working baseline
+
+Before modifications:
+
+- create git tag / branch,
+- verify µT-Kernel boot,
+- verify serial output,
+- verify current debug build.
+
+Recommended tag:
+
+```text
+pre-sleep-pivot
+```
+
+---
+
+## Phase 1 — rename the current application concept
+
+Update:
+
+- README,
+- context,
+- system overview,
+- architecture diagrams,
+- stale FoG references.
+
+Do not delete the historical documentation immediately.
+
+Mark it as:
+
+```text
+legacy / previous target
+```
+
+---
+
+## Phase 2 — create new PC sleep ML pipeline
+
+Goal:
+
+```text
+public sleep data
+      ↓
+preprocessing
+      ↓
+binary event model
+      ↓
+evaluation
+      ↓
+INT8 export
+      ↓
+golden vectors
+```
+
+This must work before embedded ML integration.
+
+---
+
+## Phase 3 — replay pipeline on board
+
+Before real sensors:
+
+```text
+public recorded epoch
+      ↓
+OSPI / compiled array / USB
+      ↓
+M85 preprocessing
+      ↓
+model inference
+      ↓
+correct result
+```
+
+This is the first major vertical slice.
+
+---
+
+## Phase 4 — real sensor integration
+
+Integrate one sensor at a time.
+
+Recommended order:
+
+1. SpO₂ / PPG
+2. respiratory effort
+3. accelerometer
+4. PDM audio
+
+Each sensor needs:
+
+- standalone driver test,
+- timestamping,
+- ring buffer,
+- quality metric.
+
+---
+
+## Phase 5 — adaptive sensing
+
+Implement state machine.
+
+Test using replayed events before relying on live physiology.
+
+---
+
+## Phase 6 — event manager and triage
+
+Implement event records and session summary.
+
+---
+
+## Phase 7 — NPU integration
+
+Only after CPU inference is stable.
+
+---
+
+## Phase 8 — federation and personalization
+
+Federation can run on PC first.
+
+Personal baseline normalization should already be integrated into model features.
+
+---
+
+## Phase 9 — M33 stretch work
+
+Attempt only if all mandatory components are stable.
+
+---
+
+# 37. Mandatory Vertical Slice
+
+The project is not considered integrated until this works:
+
+```text
+real/replayed sleep epoch
+        ↓
+M85 receives data
+        ↓
+µT-Kernel task scheduling
+        ↓
+preprocessing
+        ↓
+signal-quality check
+        ↓
+model inference
+        ↓
+event score
+        ↓
+event manager
+        ↓
+visible output
+```
+
+Minimum output:
+
+```text
+window_id
+signal_quality
+event_probability
+normal/suspicious/uncertain
+inference_latency
+```
+
+This is the single most important milestone.
+
+---
+
+# 38. Minimum Contest-V1 Feature Set
+
+Mandatory:
+
+- EK-RA8P1 boots µT-Kernel.
+- real RTOS tasks exist.
+- at least two physiological modalities are ingested or faithfully replayed.
+- signal-quality logic works.
+- adaptive-sensing state machine works.
+- a genuine sleep-apnea model runs on board.
+- output includes normal / suspicious / uncertain.
+- event duration and oxygen drop are recorded.
+- personalization uses user baseline normalization.
+- nightly research triage is produced.
+- PC-side federated learning is demonstrated.
+- raw data vs model-update privacy boundary is documented.
+- latency/RAM/model-size are measured.
+- golden vectors pass.
+
+Strongly desired:
+
+- onboard PDM audio,
+- accelerometer,
+- NPU inference,
+- real SpO₂ sensor,
+- display UI.
+
+Stretch:
+
+- M33 training,
+- Ethernet federation between physical boards,
+- TrustZone privacy gate,
+- contactless camera,
+- multi-class apnea typing,
+- ECG.
+
+---
+
+# 39. Acceptance Criteria
+
+## Firmware
+
+PASS when:
+
+- board boots reliably,
+- tasks start,
+- no sensor task deadlocks,
+- replay test produces correct predictions,
+- sensor buffers do not overflow under target configuration,
+- no missed sensor deadlines under normal inference.
+
+## ML
+
+PASS when:
+
+- subject-grouped split is enforced,
+- float model metrics are recorded,
+- quantized model metrics are recorded,
+- quantization degradation is acceptable,
+- golden vectors are generated.
+
+## Embedded inference
+
+PASS when:
+
+- board output matches golden reference within tolerance,
+- latency is measured,
+- memory use is documented.
+
+## Adaptive sensing
+
+PASS when:
+
+- LOW → HIGH mode transition occurs on test events,
+- HIGH → LOW recovery occurs,
+- no repeated trigger loop,
+- sensor-fault path works.
+
+## Personalization
+
+PASS when:
+
+- a baseline is stored,
+- normalized features use the baseline,
+- output differs appropriately when baseline changes in a controlled test.
+
+## Triage
+
+PASS when:
+
+- accepted events accumulate,
+- duration and SpO₂ drop are calculated,
+- session summary is generated,
+- triage output is deterministic for the same session.
+
+## Federation
+
+PASS when:
+
+- clients have disjoint subject groups,
+- local training works,
+- FedAvg runs,
+- global model redistributes,
+- per-client metrics are recorded.
+
+---
+
+# 40. Failure Policy
+
+The system should fail safely.
+
+Examples:
+
+```text
+SpO₂ sensor missing
+→ mark modality missing
+→ do not silently replace with fake values
+```
+
+```text
+audio driver fails
+→ run reduced-modality model if supported
+→ lower confidence
+```
+
+```text
+model inference fails
+→ report inference error
+→ continue sensor acquisition
+```
+
+```text
+Ethernet unavailable
+→ continue local screening
+→ defer federation
+```
+
+```text
+M33 unavailable
+→ continue M85 screening
+→ federation/training disabled
+```
+
+Local screening must not depend on network availability.
+
+---
+
+# 41. Non-Goals for Contest V1
+
+Do not spend contest time building:
+
+- a clinically validated diagnosis device,
+- full polysomnography replacement,
+- production HIPAA/GDPR compliance,
+- cloud hospital infrastructure,
+- a mobile app ecosystem,
+- full secure OTA,
+- full TrustZone isolation,
+- sophisticated clinical sleep staging,
+- on-device large-model training,
+- five disease detectors,
+- camera-based monitoring,
+- exact obstructive vs central diagnostic classification unless the core project is already complete.
+
+These are future extensions.
+
+---
+
+# 42. Security / Privacy Boundaries
+
+Development mode and intended product mode are different.
+
+## Development mode
+
+May allow:
+
+- raw serial dumps,
+- dataset replay,
+- USB signal export,
+- debugging.
+
+## Intended contest architecture
+
+Should emphasize:
+
+- local inference,
+- local raw audio processing,
+- local raw physiological data,
+- summaries/model weights only cross network boundary.
+
+Do not claim hardware-enforced privacy until TrustZone/egress controls are actually implemented.
+
+---
+
+# 43. Demo Story
+
+Final demo should be understandable in under two minutes.
+
+Recommended sequence:
+
+## Step 1
+
+Show live/replayed normal sleep.
+
+```text
+Mode: LOW-DETAIL
+Status: NORMAL
+```
+
+## Step 2
+
+Replay or trigger suspicious breathing pattern.
+
+```text
+respiration decreases
+SpO₂ trend changes
+```
+
+## Step 3
+
+Adaptive controller switches:
+
+```text
+LOW-DETAIL
+    ↓
+HIGH-DETAIL
+```
+
+## Step 4
+
+Full model runs.
+
+```text
+Possible respiratory event
+Confidence: 0.91
+```
+
+## Step 5
+
+Show evidence.
+
+```text
+SpO₂ drop
+respiration change
+audio score
+movement quality
+```
+
+## Step 6
+
+Show event added to nightly summary.
+
+## Step 7
+
+Show patient baseline / personalization.
+
+## Step 8
+
+Show federated-learning visualization on PC.
+
+```text
+Hospital A
+Hospital B
+Hospital C
+      ↓
+FedAvg
+      ↓
+new global model
+```
+
+## Step 9
+
+Show CPU vs NPU benchmark if complete.
+
+This tells one coherent story.
+
+---
+
+# 44. Why RA8P1 Matters
+
+The board must be justified with measured system behavior.
+
+Project thesis:
+
+```text
+M85
+handles deterministic real-time sensing + DSP
+
+U55
+handles neural-network inference
+
+M33
+can handle low-priority adaptation/federation
+
+µT-Kernel
+coordinates deadlines and task isolation
+```
+
+The board matters because this workload combines:
+
+- high-rate audio,
+- lower-rate physiological sensors,
+- DSP,
+- AI,
+- UI,
+- logging,
+- communication,
+- and potentially background adaptation.
+
+The strongest proof is not a specification table.
+
+The strongest proof is:
+
+```text
+sensor deadline misses with CPU-only inference
+vs
+sensor deadline misses / CPU occupancy with NPU inference
+```
+
+plus measured latency.
+
+---
+
+# 45. Coding Rules
+
+For embedded code:
+
+- no dynamic allocation in hard real-time paths unless justified,
+- bounded loops,
+- explicit buffer sizes,
+- no blocking networking from sensor tasks,
+- no printf spam in high-rate loops,
+- no ML work inside interrupt handlers,
+- ISR should signal tasks / fill buffers only,
+- use monotonic timestamps,
+- centralize error codes,
+- track dropped samples,
+- track buffer overruns.
+
+For ML code:
+
+- deterministic seeds where practical,
+- subject-grouped splits,
+- no train/test leakage,
+- preprocessing parameters saved,
+- model artifacts versioned,
+- export metadata saved,
+- float vs quantized evaluation both recorded.
+
+---
+
+# 46. Artifact Versioning
+
+Every exported model should have metadata.
+
+Example:
+
+```json
+{
+  "model_name": "fedtinyrt_sleep_v1",
+  "model_version": "0.3.0",
+  "dataset_version": "apnea_mix_v2",
+  "window_seconds": 30,
+  "modalities": [
+    "spo2",
+    "respiration",
+    "accel",
+    "audio"
+  ],
+  "quantization": "int8",
+  "input_shape": "...",
+  "created_at": "...",
+  "git_commit": "..."
+}
+```
+
+Firmware should expose the active model version over telemetry.
+
+---
+
+# 47. Data Contracts
+
+Define contracts early.
+
+## Sensor sample
+
+```c
+typedef struct {
+    uint64_t timestamp_us;
+    float value;
+    float quality;
+    uint8_t source;
+} scalar_sample_t;
+```
+
+## Modality state
+
+```c
+typedef struct {
+    bool present;
+    bool live;
+    float quality;
+    uint64_t last_sample_us;
+} modality_state_t;
+```
+
+## Inference output
+
+```c
+typedef struct {
+    float event_probability;
+    float signal_quality;
+    uint8_t prediction;
+    uint32_t inference_time_us;
+} inference_result_t;
+```
+
+Exact types may change, but the contracts should remain explicit.
+
+---
+
+# 48. Required New Documentation
+
+The repository should eventually contain:
+
+```text
+README.md
+context.md
+PROJECT_BRIEF.md
+HARDWARE.md
+MODEL_CARD.md
+DATASET.md
+FEDERATION.md
+DEMO.md
+SETUP_NOTES.md
+```
+
+The old Parkinson/FoG documents must either:
+
+- be rewritten,
+- moved to `docs/legacy/`,
+- or clearly marked obsolete.
+
+Do not leave contradictory top-level docs.
+
+---
+
+# 49. Recommended Issue / Milestone Breakdown
+
+## S0 — preserve baseline
+
+- boot
+- serial
+- git tag
+- clean build
+
+## S1 — sleep ML baseline
+
+- dataset
+- preprocessing
+- grouped split
+- binary model
+- metrics
+
+## S2 — quantization
+
+- INT8
+- golden vectors
+- C/TFLite artifact
+
+## S3 — board replay
+
+- sample window on board
+- preprocessing
+- CPU inference
+
+## S4 — sensor framework
+
+- ring buffers
+- timestamps
+- quality state
+
+## S5 — SpO₂ + respiration
+
+- real drivers
+- live data
+- quality checks
+
+## S6 — adaptive sensing
+
+- state machine
+- triggers
+- recovery
+
+## S7 — event manager / triage
+
+- event records
+- nightly summary
+
+## S8 — audio + accelerometer
+
+- multimodal fusion
+
+## S9 — NPU
+
+- Vela/toolchain
+- U55 inference
+- benchmark
+
+## S10 — federation
+
+- multi-site simulation
+- metrics
+- personalization
+
+## S11 — M33 stretch
+
+- background training / federation
+
+## S12 — demo hardening
+
+- UI
+- README
+- benchmarks
+- video
+- final clean build
+
+---
+
+# 50. Definition of Done
+
+FedTinyRT Sleep is contest-ready when a reviewer can see:
+
+1. a real EK-RA8P1 running µT-Kernel,
+2. real tasks, not a single blocking loop,
+3. sleep-related signals entering the board,
+4. quality-aware adaptive sensing,
+5. a quantized sleep-apnea model running locally,
+6. visible normal/suspicious/uncertain output,
+7. event duration and oxygen effect being tracked,
+8. per-user baseline personalization,
+9. an overnight triage summary,
+10. a working federated-learning experiment,
+11. measured embedded latency/memory,
+12. and a clear reason the RA8P1 architecture matters.
+
+The project does **not** need to finish every future feature to be strong.
+
+The priority order is:
+
+```text
+CORRECTNESS
+   ↓
+END-TO-END INTEGRATION
+   ↓
+REAL-TIME RELIABILITY
+   ↓
+MEASUREMENTS
+   ↓
+ADAPTIVE + PERSONALIZED BEHAVIOR
+   ↓
+FEDERATION
+   ↓
+NPU OPTIMIZATION
+   ↓
+M33 / SECURITY STRETCH WORK
+```
+
+---
+
+# 51. Immediate Next Actions
+
+The next development session should begin with the following tasks.
+
+## Repository
+
+- create `pre-sleep-pivot` tag/branch,
+- move old bearing ML scripts under `ml/legacy_bearing/`,
+- create `ml/sleep/`,
+- update top-level docs to point to this context file.
+
+## ML
+
+- choose the first public dataset,
+- define subject-level train/val/test split,
+- build a minimal binary apnea-event baseline,
+- export preprocessing metadata,
+- quantify with AUPRC/sensitivity/specificity,
+- export first INT8 model,
+- generate golden vectors.
+
+## Firmware
+
+- preserve current µT-Kernel boot,
+- replace sleep-forever `usermain()` behavior with task creation,
+- create generic ring-buffer and timestamp infrastructure,
+- implement board replay mode before real sensors,
+- pass one golden vector end-to-end.
+
+## Hardware
+
+- finalize SpO₂/PPG module,
+- finalize respiratory-effort sensor,
+- finalize accelerometer,
+- verify available pins and switch configuration,
+- bring up one sensor at a time.
+
+## Integration
+
+The first major milestone is:
+
+```text
+public/replayed sleep epoch
+        ↓
+RA8P1
+        ↓
+µT-Kernel
+        ↓
+preprocessing
+        ↓
+INT8 inference
+        ↓
+correct event result
+```
+
+Everything else builds on this.
+
+---
+
+# 52. Final Engineering Principle
+
+FedTinyRT should not become a collection of impressive words:
+
+```text
+multimodal
+federated
+personalized
+NPU
+adaptive
+privacy
+```
+
+Every concept must solve a real system problem.
+
+```text
+Multimodal
+→ one noisy sensor should not decide everything.
+
+Adaptive sensing
+→ high-detail processing is used when it is actually needed.
+
+Signal quality
+→ the device knows when data is unreliable.
+
+Personalization
+→ "normal" differs between people.
+
+Triage
+→ the output helps prioritize who needs formal evaluation.
+
+Federation
+→ sites improve a shared model without pooling raw recordings.
+
+NPU
+→ AI does not steal real-time CPU budget.
+
+µT-Kernel
+→ all of those jobs happen predictably and concurrently.
+```
+
+That is the core engineering story of the new FedTinyRT.

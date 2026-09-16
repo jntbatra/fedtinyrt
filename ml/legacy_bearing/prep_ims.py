@@ -17,7 +17,7 @@ import numpy as np
 from feature_extract import extract, windows_from_signal
 
 HERE = os.path.dirname(__file__)
-DATA = os.path.join(HERE, "data")
+DATA = os.path.join(HERE, "..", "data")  # preserve existing downloads
 ART = os.path.join(HERE, "artifacts")
 
 # IMS channel layout: 2nd_test has 4 cols (1 per bearing); bearing 1 = col 0.

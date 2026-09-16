@@ -1,5 +1,8 @@
 # FedTinyRT EK-RA8P1 Setup Notes
 
+> Historical bring-up record. The sleep migration retains this project setup;
+> current behavior and outstanding board checks are in README.md and DEMO.md.
+
 ## What Was Done
 
 ### 1. Repositories Cloned

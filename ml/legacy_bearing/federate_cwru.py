@@ -18,7 +18,7 @@ from feature_extract import extract, windows_from_signal
 
 tf.get_logger().setLevel("ERROR")
 np.random.seed(0); tf.random.set_seed(0)
-DATA = os.path.join(os.path.dirname(__file__), "data", "cwru", "Data")
+DATA = os.path.join(os.path.dirname(__file__), "..", "data", "cwru", "Data")
 CLASSES = ["normal", "inner", "outer", "ball"]
 CAP = 40  # max windows per file (balance)
 
