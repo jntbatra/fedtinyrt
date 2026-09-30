@@ -1,83 +1,128 @@
-# On-device sleep apnea screening — adaptive & privacy-preserving
+<h1 align="center">On-device sleep apnea screening</h1>
+<p align="center"><b>Adaptive · Privacy-preserving · Runs on a microcontroller</b></p>
+<p align="center">
+A sleep apnea / hypopnea screener that runs entirely on a Renesas EK-RA8P1
+(Arm Cortex-M85 + Ethos-U55 NPU), recalibrates itself to each patient overnight
+with no labels, and improves across a fleet while patient data never leaves the device.
+</p>
 
-A sleep apnea / hypopnea screener that runs **entirely on a microcontroller**
-(Renesas EK-RA8P1, Arm Cortex-M85), **adapts to each patient on the device**
-without any labelled data, and **improves across devices through federation** —
-sharing only calibration statistics, never patient data.
+<p align="center">
+  <img src="assets/demo.gif" alt="Live apnea dashboard running on the EK-RA8P1 board" width="70%">
+</p>
 
-![Live on-board dashboard](assets/demo.gif)
+### What you are looking at
 
-*Live dashboard running on the real board: the model streams a night of data and
-shows the apnea/normal verdict, the input features, and the measured accuracy in
-real time.*
+The clip above is the model running **live on the real board's 1024×600 LCD**, no PC in the loop.
+A full night of physiological data is streamed through the on-device INT8 network in real time, and the dashboard shows:
 
-> **Research prototype, not a clinical device.** No medical claims. Every number
-> below is measured and reported honestly, including what is not yet proven.
+- **The verdict** — a large **APNEA** (red) / **NORMAL** (green) tile that flips as each window is scored.
+- **The live input features** — the 10 SpO₂-derived values (green) feeding the model, refreshed every 0.5 s.
+- **Balanced accuracy — 82.6 %** — the measured sealed-cohort score, shown on-device.
+- **Real-time INT8 inference on the Cortex-M85**, every window, on real silicon.
+
+> **Research prototype, not a clinical device.** No medical claims. Every headline number below is measured, and the open questions are stated plainly.
 
 ---
 
 ## Highlights
 
-- **On-device inference:** a 10→32→16→1 INT8 MLP (897 parameters, SpO2 features).
-  **77 µs** per calibrated session, **~2 KB** RAM, **6.7 µs** per inference —
-  and **bit-exact** against the host reference.
-- **Label-free self-calibration:** **+0.035 balanced accuracy** on a *sealed*
-  cohort of unseen patients (0.791 → 0.826, 95% CI [+0.006, +0.065]) — with **no
-  labels** at inference. The label-free path matches the labelled one.
-- **Privacy-preserving federation:** pooling calibration across 1→70 devices adds
-  **+0.048 balanced accuracy** (CI [+0.036, +0.060]), saturating at ~20–40 devices.
-  Only calibration statistics leave a device — never raw patient signals.
-- **A working edge dashboard** on the board's LCD (see the demo above).
+| | Result |
+|---|---|
+| **On-device adaptation** | **+0.035** balanced accuracy on unseen patients (0.791 → 0.826), 95% CI [+0.006, +0.065], **label-free** |
+| **Federation** | **+0.048** balanced accuracy pooling 1→70 devices; only calibration statistics leave the device, never data |
+| **Speed (measured)** | CPU **6.75 µs** / inference · **NPU (Ethos-U55) 3.87 µs**, **1.74× faster**, decisions identical |
+| **Footprint** | 10→32→16→1 INT8 MLP, **897 params**, **~2 KB** RAM, bit-exact vs host |
 
-Full numbers and methodology: [`docs/RESULTS.md`](docs/RESULTS.md).
+Authoritative results and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) · NPU on hardware: [`final_npu_results.md`](final_npu_results.md).
 
 ---
 
-## What the demo shows
+## Quickstart — run it yourself (no hardware needed)
 
-The board runs the shipped INT8 model in real time. Each window (60 s of a night)
-produces an **APNEA** or **NORMAL** verdict, shown large, alongside the model
-probability, the live input feature vector, and the measured balanced accuracy.
+The full training → INT8 export → verification → federation pipeline runs end to end on a
+**synthetic fixture**, on any OS, CPU-only. This exercises the real software; it does **not**
+reproduce the clinical numbers (those need the CinC 2018 dataset — see *Reproducing the results* below).
 
-**An honest note on the sensor.** We were not able to attach live SpO2 sensors to a
-patient — we are building this from a remote area in India, where the clinical-grade
-sensor hardware and setup would have been prohibitively expensive for us. So instead
-of live capture, we stream **real recorded overnight recordings** (from the CinC 2018
-clinical dataset) into the board one window at a time. The board runs *exactly* the
-same inference it would on a live signal — the sensor front-end is the one piece we
-have not wired yet, and it is on the roadmap.
+```bash
+# 1. clone
+git clone https://github.com/jntbatra/fedtinyrt.git
+cd fedtinyrt
+
+# 2. create an environment and install deps
+python3 -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\activate
+python -m pip install -r ml/sleep/requirements.txt
+
+# 3. generate the synthetic fixture
+python -m ml.sleep.synthesize
+
+# 4. train + export the INT8 model
+python -m ml.sleep.train_tflite --data ml/sleep/data/synthetic.npz --epochs 2 --allow-synthetic
+
+# 5. verify the INT8 golden vectors match
+python -m ml.sleep.verify
+
+# 6. run a federation round
+python -m ml.sleep.federate --data ml/sleep/data/synthetic.npz --rounds 1 --allow-synthetic
+
+# 7. (optional) run the test suite
+python -m pytest -q tests/test_sleep_ml.py
+```
+
+Artifacts (model, scaler, INT8 arrays, golden vectors, metrics, federation weights) land in
+`ml/sleep/artifacts/`. Every model records whether it was trained on synthetic data.
+
+> The synthetic labels and waveforms are invented — their metrics are a software check only,
+> never a sleep-apnea performance claim.
 
 ---
 
-## Results (sealed cohort, n = 25 unseen patients)
+## Run on the board (needs the hardware)
 
-| method | balanced accuracy | Δ vs shipped | 95% CI |
-|---|---|---|---|
-| fixed threshold (shipped) | 0.7910 | — | — |
-| label-free recalibration | **0.8256** | **+0.0347** | [+0.0057, +0.0651] |
-| labelled reference | 0.8269 | +0.0359 | [+0.0080, +0.0656] |
+The live dashboard in the GIF is firmware for the **Renesas EK-RA8P1**. Sources, build and flash
+steps are in [`firmware/apnea_dashboard/`](firmware/apnea_dashboard/README.md). In short:
 
-Reported as **balanced accuracy** (the rare-class-safe metric), not raw accuracy.
-Ranking (AUROC) is unchanged — the gain is at the operating point. See
-[`docs/RESULTS.md`](docs/RESULTS.md) for federation curves, metrics, and limitations.
+```bash
+export ARM_GCC_TOOLCHAIN_PATH=/path/to/arm-gnu-toolchain/bin
+cmake --preset ReleaseCI && cmake --build --preset ReleaseCI
+JLinkExe -device R7KA8P1AF -if SWD -speed 4000 -autoconnect 1 -CommanderScript flash_dash.jlink
+```
+
+On reset the board free-runs the dashboard on its own. To stream a recorded night over serial:
+
+```bash
+python3 firmware/apnea_dashboard/live_demo.py --board --loop --subject tr03-0413
+```
 
 ---
 
 ## How it works
 
 ```
- SpO2 signal ─▶ 60 s window features ─▶ INT8 MLP (Cortex-M85) ─▶ APNEA / NORMAL
+ SpO2 signal ─▶ 60 s window features ─▶ INT8 MLP (Cortex-M85 / Ethos-U55) ─▶ APNEA / NORMAL
                                               │
                  ┌────────────────────────────┴───────────────────────────┐
                  ▼                                                          ▼
    per-session recalibration (on device, label-free)     fleet federation (calibration stats only)
 ```
 
-- **On-device inference** — the INT8 model runs on the M85 core, pure CPU.
-- **Label-free recalibration** — each session re-centres its own decision threshold
-  from its unlabelled data. This is the +0.035 gain.
-- **Federation** — devices pool calibration statistics into a shared reference; a new
-  device benefits from the fleet without any patient data leaving any device.
+- **On-device inference** — the INT8 model runs on the Cortex-M85; the same network also runs on the Ethos-U55 NPU (1.74× faster, measured).
+- **Label-free recalibration** — each session recentres its own decision threshold from its unlabelled data. This is the +0.035 gain.
+- **Federation** — devices pool calibration statistics into a shared reference; no patient data leaves any device.
+
+---
+
+## Reproducing the clinical results
+
+The headline numbers (+0.035, +0.048, and the NPU measurement) come from the CinC 2018 SpO₂ pipeline
+and the on-board Ethos-U55 integration, documented step by step in:
+
+- [`docs/RESULTS.md`](docs/RESULTS.md) — sealed-cohort calibration + federation, with confidence intervals.
+- [`final_npu_results.md`](final_npu_results.md) — the measured NPU results and full reproduction recipe.
+- [`docs/NPU_VELA.md`](docs/NPU_VELA.md) — the Vela compilation report.
+- [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md) — chronological record.
+
+These require the PhysioNet CinC 2018 data (not committed — patient data never lives in this repo).
 
 ---
 
@@ -86,50 +131,22 @@ Ranking (AUROC) is unchanged — the gain is at the operating point. See
 | path | what |
 |---|---|
 | `firmware/apnea_dashboard/` | on-board LCD dashboard firmware + build/flash + host driver |
-| `ml/` | training / feature / federation pipeline (Python) |
-| `docs/RESULTS.md` | authoritative results and methodology |
-| `docs/ENGINEERING_LOG.md` | chronological engineering record |
-| `docs/BOARD_NOTES.md` | board setup, commands, reproduction notes |
-| `apnea_project.pptx` | project presentation |
-| `apnea_speaker_script.md` | per-slide speaker script |
+| `ml/sleep/` | runnable training / INT8 export / federation pipeline (synthetic-fixture reproducible) |
+| `docs/` | results, NPU report, engineering log, board notes |
+| `final_npu_results.md` | measured Ethos-U55 NPU results |
 | `assets/` | demo GIF / MP4 |
 | `src/`, `ra/`, `ra_gen/`, `ra_cfg/`, `script/` | RA8P1 / FSP firmware project |
+| `tests/` | host C + Python checks |
 
 ---
 
-## Run it
+## Honest scope
 
-### Board dashboard
-See [`firmware/apnea_dashboard/README.md`](firmware/apnea_dashboard/README.md).
-Build with the Arm GNU toolchain, flash with J-Link, and the board animates on its
-own. Drive a real night over serial:
+- Validated on **25 sealed patients** (target 100–200). The gain's CI lower bound (+0.0057) does not yet clear the pre-registered +0.02 minimum effect — promising, needs a wider cohort.
+- **AUROC (ranking) is unchanged** — the gain is at the decision threshold.
+- The apnea-hour index is a **window-count proxy**; event-scored AHI is future work.
+- **No energy figure** — there is no current probe; only cycles and RAM are reported.
+- The NPU currently runs a **re-quantised twin** of the deployed model (same weights, different INT8 scheme); parity is checked against the TFLite reference.
+- The **sensor front-end is not wired** — the board runs recorded data; live capture is future work.
 
-```bash
-python3 firmware/apnea_dashboard/live_demo.py --board --loop --subject tr03-0413
-```
-
-### ML pipeline
-```bash
-pip install tensorflow scikit-learn numpy scipy   # see ml/ for details
-# training / feature extraction / federation live under ml/
-```
-
----
-
-## Presentation
-- **Deck:** [`apnea_project.pptx`](apnea_project.pptx)
-- **Speaker script (per slide):** [`apnea_speaker_script.md`](apnea_speaker_script.md)
-
----
-
-## Scope & what is not yet claimed
-- Validated on **25 sealed patients** (target: 100–200). The gain's CI lower bound
-  (+0.0057) does not yet clear our pre-registered +0.02 minimum effect — promising,
-  needs a wider cohort.
-- **AUROC unchanged** — the gain is at the decision threshold, not ranking.
-- **AHI** is reported as a window-count proxy; a proper event-scored index is future work.
-- **No energy figure** — no current probe on the board; we report cycles and RAM only.
-- The **Ethos-U55 NPU** is present in silicon but **unused** — inference runs on the CPU.
-- The **sensor front-end** is not wired; the board runs recorded data (see above).
-
-These are the roadmap, not failures — each builds on something already demonstrated.
+These are the roadmap, not failures. Each one builds on something already demonstrated.
