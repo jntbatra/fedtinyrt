@@ -1,0 +1,5 @@
+h
+loadfile build/Release/cam2lcd.elf
+r
+g
+q

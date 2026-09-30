@@ -22,3 +22,7 @@ ml/legacy_bearing/artifacts/*.tflite
 ml/legacy_bearing/artifacts/saved_model/
 ml/sleep/data/
 ml/sleep/artifacts/
+
+# internal scratch / working copies
+handoff/
+.~lock.*#
