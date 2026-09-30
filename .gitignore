@@ -26,3 +26,7 @@ ml/sleep/artifacts/
 # internal scratch / working copies
 handoff/
 .~lock.*#
+
+# presentation deliverables kept out of the repo
+apnea_project.pptx
+apnea_speaker_script.md
